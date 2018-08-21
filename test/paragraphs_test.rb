@@ -26,7 +26,7 @@ Paragraph.
 Winning.
       EOS
       output = render_embedded_string input
-      
+
       assert_css 'p', output, 2
       assert_xpath '(//p)[1]/preceding-sibling::*[@class = "title"]', output, 1
       assert_xpath '(//p)[1]/preceding-sibling::*[@class = "title"][text() = "Titled"]', output, 1
@@ -60,7 +60,7 @@ paragraph
 . wrapped line
       EOS
 
-      output = render_embedded_string input 
+      output = render_embedded_string input
       assert_css 'p', output, 1
       assert_xpath %(//p[text()="paragraph\n. wrapped line"]), output, 1
     end
@@ -71,7 +71,7 @@ paragraph
 .wrapped line
       EOS
 
-      output = render_embedded_string input 
+      output = render_embedded_string input
       assert_css 'p', output, 1
       assert_xpath %(//p[text()="paragraph\n.wrapped line"]), output, 1
     end
@@ -156,29 +156,29 @@ Note that multi-entry terms generate separate index entries.
 
       output = render_embedded_string input, :attributes => {'backend' => 'docbook45'}
       assert_xpath '/simpara', output, 1
-      term1 = (xmlnodes_at_xpath '(//indexterm)[1]', output, 1).first
+      term1 = xmlnodes_at_xpath '(//indexterm)[1]', output, 1
       assert_equal '<indexterm><primary>tigers</primary></indexterm>', term1.to_s
       assert term1.next.content.start_with?('tigers')
 
-      term2 = (xmlnodes_at_xpath '(//indexterm)[2]', output, 1).first
+      term2 = xmlnodes_at_xpath '(//indexterm)[2]', output, 1
       term2_elements = term2.elements
       assert_equal 3, term2_elements.size
       assert_equal '<primary>Big cats</primary>', term2_elements[0].to_s
       assert_equal '<secondary>Tigers</secondary>', term2_elements[1].to_s
       assert_equal '<tertiary>Siberian Tiger</tertiary>', term2_elements[2].to_s
 
-      term3 = (xmlnodes_at_xpath '(//indexterm)[3]', output, 1).first
+      term3 = xmlnodes_at_xpath '(//indexterm)[3]', output, 1
       term3_elements = term3.elements
       assert_equal 2, term3_elements.size
       assert_equal '<primary>Tigers</primary>', term3_elements[0].to_s
       assert_equal '<secondary>Siberian Tiger</secondary>', term3_elements[1].to_s
 
-      term4 = (xmlnodes_at_xpath '(//indexterm)[4]', output, 1).first
+      term4 = xmlnodes_at_xpath '(//indexterm)[4]', output, 1
       term4_elements = term4.elements
       assert_equal 1, term4_elements.size
       assert_equal '<primary>Siberian Tiger</primary>', term4_elements[0].to_s
 
-      term5 = (xmlnodes_at_xpath '(//indexterm)[5]', output, 1).first
+      term5 = xmlnodes_at_xpath '(//indexterm)[5]', output, 1
       assert_equal '<indexterm><primary>Linux</primary></indexterm>', term5.to_s
       assert term5.next.content.start_with?('Linux')
 
@@ -194,7 +194,7 @@ Note that multi-entry terms generate separate index entries.
       EOS
 
       output = render_embedded_string input
-      assert output.include?('*&lt;Hey Jude&gt;*')
+      assert_includes output, '*&lt;Hey Jude&gt;*'
     end
 
     test 'normal paragraph should honor specialchars shorthand' do
@@ -204,7 +204,7 @@ Note that multi-entry terms generate separate index entries.
       EOS
 
       output = render_embedded_string input
-      assert output.include?('*&lt;Hey Jude&gt;*')
+      assert_includes output, '*&lt;Hey Jude&gt;*'
     end
 
     test 'should add a hardbreak at end of each line when hardbreaks option is set' do
@@ -218,7 +218,7 @@ lips
       output = render_embedded_string input
       assert_css 'br', output, 2
       assert_xpath '//p', output, 1
-      assert output.include?("<p>read<br>\nmy<br>\nlips</p>")
+      assert_includes output, "<p>read<br>\nmy<br>\nlips</p>"
     end
   end
 
@@ -293,7 +293,7 @@ use the source, luke!
 die 'zomg perl sucks';
       EOS
       output = render_embedded_string input
-      assert_xpath %(/*[@class="listingblock"]//pre[@class="highlight"]/code[@class="perl language-perl"][text()="die 'zomg perl sucks';"]), output, 1
+      assert_xpath %(/*[@class="listingblock"]//pre[@class="highlight"]/code[@class="language-perl"][@data-lang="perl"][text()="die 'zomg perl sucks';"]), output, 1
     end
 
     test 'literal paragraph terminates at block attribute list' do
@@ -371,7 +371,7 @@ _GET /groups/link:#group-id[\{group-id\}]_
       EOS
 
       output = render_embedded_string input
-      assert output.include?('<pre class="content"><em>GET /groups/<a href="#group-id">{group-id}</a></em></pre>')
+      assert_includes output, '<pre class="content"><em>GET /groups/<a href="#group-id">{group-id}</a></em></pre>'
     end
 
     test 'quote paragraph should honor explicit subs list' do
@@ -382,7 +382,7 @@ _GET /groups/link:#group-id[\{group-id\}]_
       EOS
 
       output = render_embedded_string input
-      assert output.include?('*Hey Jude*')
+      assert_includes output, '*Hey Jude*'
     end
   end
 
@@ -418,6 +418,26 @@ Content goes here
       assert_xpath "//*[@class='sidebarblock']//p", result, 1
     end
 
+    test 'should process preprocessor conditional in paragrpah content' do
+      input = <<-EOS
+ifdef::asciidoctor-version[]
+[sidebar]
+First line of sidebar.
+ifdef::backend[The backend is {backend}.]
+Last line of sidebar.
+endif::[]
+      EOS
+
+      result = render_embedded_string input
+      assert_equal %(<div class="sidebarblock">
+<div class="content">
+First line of sidebar.
+The backend is html5.
+Last line of sidebar.
+</div>
+</div>), result
+    end
+
     context 'Styled Paragraphs' do
       test 'should wrap text in simpara for styled paragraphs when rendered to DocBook' do
         input = <<-EOS
@@ -445,6 +465,9 @@ As you can see here.
 
 [quote]
 Wise words from a wise person.
+
+[open]
+Make it what you want.
         EOS
 
         output = render_string input, :backend => 'docbook'
@@ -453,6 +476,18 @@ Wise words from a wise person.
         assert_css 'sidebar > simpara', output, 1
         assert_css 'informalexample > simpara', output, 1
         assert_css 'blockquote > simpara', output, 1
+        assert_css 'chapter > simpara', output, 1
+      end
+
+      test 'should convert open paragraph to open block' do
+        input = <<-EOS
+[open]
+Make it what you want.
+        EOS
+
+        output = render_embedded_string input
+        assert_css '.openblock', output, 1
+        assert_css '.openblock p', output, 0
       end
 
       test 'should wrap text in simpara for styled paragraphs with title when rendered to DocBook' do
@@ -514,10 +549,13 @@ Wise words from a wise person.
         assert_equal '<a href="http://asciidoc.org">AsciiDoc</a> is a <em>lightweight</em> markup language&#8230;&#8203;', output
       end
 
-      test 'should output empty string if first block is not a paragraph' do
+      test 'should output nil and warn if first block is not a paragraph' do
         input = '* bullet'
-        output = render_string input, :doctype => 'inline'
-        assert output.empty?
+        using_memory_logger do |logger|
+          output =  render_string input, :doctype => 'inline'
+          assert_nil output
+          assert_message logger, :WARN, '~no inline candidate'
+        end
       end
     end
   end

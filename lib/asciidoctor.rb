@@ -1,3 +1,4 @@
+# encoding: UTF-8
 RUBY_ENGINE = 'unknown' unless defined? RUBY_ENGINE
 RUBY_ENGINE_OPAL = (RUBY_ENGINE == 'opal')
 RUBY_ENGINE_JRUBY = (RUBY_ENGINE == 'jruby')
@@ -6,20 +7,21 @@ RUBY_MIN_VERSION_2 = (RUBY_VERSION >= '2')
 
 require 'set'
 
-# NOTE RUBY_ENGINE == 'opal' conditional blocks are filtered by the Opal preprocessor
+# NOTE RUBY_ENGINE == 'opal' conditional blocks like this are filtered by the Opal preprocessor
 if RUBY_ENGINE == 'opal'
-  require 'encoding' # needed for String.bytes method
-  require 'strscan'
-  require 'asciidoctor/opal_ext'
+  # this require is satisfied by the Asciidoctor.js build; it augments the Ruby environment for Asciidoctor.js
+  require 'asciidoctor/js'
 else
   autoload :Base64, 'base64'
-  autoload :FileUtils, 'fileutils'
+  autoload :URI, 'uri'
   autoload :OpenURI, 'open-uri'
   autoload :StringScanner, 'strscan'
 end
 
 # ideally we should use require_relative instead of modifying the LOAD_PATH
 $:.unshift File.dirname __FILE__
+
+require 'asciidoctor/logging'
 
 # Public: Methods for parsing AsciiDoc input files and converting documents
 # using eRuby templates.
@@ -63,7 +65,7 @@ module Asciidoctor
 
     # A safe mode level that closely parallels safe mode in AsciiDoc. This value
     # prevents access to files which reside outside of the parent directory of
-    # the source file and disables any macro other than the include::[] macro.
+    # the source file and disables any macro other than the include::[] directive.
     SAFE = 1;
 
     # A safe mode level that disallows the document from setting attributes
@@ -77,7 +79,7 @@ module Asciidoctor
     # A safe mode level that disallows the document from attempting to read
     # files from the file system and including the contents of them into the
     # document, in additional to all the security features of SafeMode::SERVER.
-    # For instance, this level disallows use of the include::[] macro and the
+    # For instance, this level disallows use of the include::[] directive and the
     # embedding of binary content (data uri), stylesheets and JavaScripts
     # referenced by the document.(Asciidoctor and trusted extensions may still
     # be allowed to embed trusted content into the document).
@@ -94,23 +96,36 @@ module Asciidoctor
     # enforced)!
     #PARANOID = 100;
 
+    rec = {}
+    constants.each {|sym| rec[const_get sym] = sym.to_s.downcase }
+    @names_by_value = rec
+
+    def self.value_for_name name
+      const_get name.upcase
+    end
+
+    def self.name_for_value value
+      @names_by_value[value]
+    end
+
+    def self.names
+      @names_by_value.values
+    end
   end
 
   # Flags to control compliance with the behavior of AsciiDoc
   module Compliance
-    @keys = [].to_set
+    @keys = ::Set.new
     class << self
-      attr :keys
+      attr_reader :keys
     end
 
     # Defines a new compliance key and assigns an initial value.
     def self.define key, value
-      if key == :keys || (self.respond_to? key)
-        raise ::ArgumentError, %(Illegal key name: #{key})
-      end
       instance_variable_set %(@#{key}), value
       class << self; self; end.send :attr_accessor, key
       @keys << key
+      nil
     end
 
     # AsciiDoc terminates paragraphs adjacent to
@@ -120,8 +135,8 @@ module Asciidoctor
     # Compliance value: true
     define :block_terminates_paragraph, true
 
-    # AsciiDoc does not treat paragraphs labeled with a verbatim style
-    # (literal, listing, source, verse) as verbatim
+    # AsciiDoc does not parse paragraphs with a verbatim style
+    # (i.e., literal, listing, source, verse) as verbatim content.
     # This options allows this behavior to be modified
     # Compliance value: false
     define :strict_verbatim_paragraphs, true
@@ -133,9 +148,8 @@ module Asciidoctor
     # Compliance value: false
     #define :congruent_block_delimiters, true
 
-    # AsciiDoc supports both single-line and underlined
-    # section titles.
-    # This option disables the underlined variant.
+    # AsciiDoc supports both atx (single-line) and setext (underlined) section titles.
+    # This option can be used to disable the setext variant.
     # Compliance value: true
     define :underline_style_section_titles, true
 
@@ -156,7 +170,18 @@ module Asciidoctor
 
     # Asciidoctor will allow the id, role and options to be set
     # on blocks using a shorthand syntax (e.g., #idname.rolename%optionname)
+    # Compliance value: false
     define :shorthand_property_syntax, true
+
+    # Asciidoctor will attempt to resolve the target of a cross reference by
+    # matching its reference text (reftext or title) (e.g., <<Section Title>>)
+    # Compliance value: false
+    define :natural_xrefs, true
+
+    # Asciidoctor will start counting at the following number
+    # when creating a unique id when there is a conflict
+    # Compliance value: 2
+    define :unique_id_start_index, 2
 
     # Asciidoctor will recognize commonly-used Markdown syntax
     # to the degree it does not interfere with existing
@@ -169,7 +194,7 @@ module Asciidoctor
   ROOT_PATH = ::File.dirname ::File.dirname ::File.expand_path __FILE__
 
   # The absolute lib path of the Asciidoctor RubyGem
-  LIB_PATH = ::File.join ROOT_PATH, 'lib'
+  #LIB_PATH = ::File.join ROOT_PATH, 'lib'
 
   # The absolute data path of the Asciidoctor RubyGem
   DATA_PATH = ::File.join ROOT_PATH, 'data'
@@ -184,7 +209,7 @@ module Asciidoctor
 
   # Flag to indicate whether encoding can be coerced to UTF-8
   # _All_ input data must be force encoded to UTF-8 if Encoding.default_external is *not* UTF-8
-  # Addresses failures performing string operations that are reported as "invalid byte sequence in US-ASCII" 
+  # Addresses failures performing string operations that are reported as "invalid byte sequence in US-ASCII"
   # Ruby 1.8 doesn't seem to experience this problem (perhaps because it isn't validating the encodings)
   COERCE_ENCODING = !::RUBY_ENGINE_OPAL && ::RUBY_MIN_VERSION_1_9
 
@@ -192,19 +217,15 @@ module Asciidoctor
   FORCE_ENCODING = COERCE_ENCODING && ::Encoding.default_external != ::Encoding::UTF_8
 
   # Byte arrays for UTF-* Byte Order Marks
-  # hex escape sequence used for Ruby 1.8 compatibility
-  BOM_BYTES_UTF_8 = "\xef\xbb\xbf".bytes.to_a
-  BOM_BYTES_UTF_16LE = "\xff\xfe".bytes.to_a
-  BOM_BYTES_UTF_16BE = "\xfe\xff".bytes.to_a
+  BOM_BYTES_UTF_8 = [0xef, 0xbb, 0xbf]
+  BOM_BYTES_UTF_16LE = [0xff, 0xfe]
+  BOM_BYTES_UTF_16BE = [0xfe, 0xff]
 
   # Flag to indicate that line length should be calculated using a unicode mode hint
   FORCE_UNICODE_LINE_LENGTH = !::RUBY_MIN_VERSION_1_9
 
-  # Flag to indicate whether gsub can use a Hash to map matches to replacements
-  SUPPORTS_GSUB_RESULT_HASH = ::RUBY_MIN_VERSION_1_9 && !::RUBY_ENGINE_OPAL
-
   # The endline character used for output; stored in constant table as an optimization
-  EOL = "\n"
+  LF = EOL = "\n"
 
   # The null character to use for splitting attribute values
   NULL = "\0"
@@ -212,8 +233,8 @@ module Asciidoctor
   # String for matching tab character
   TAB = "\t"
 
-  # Regexp for replacing tab character
-  TAB_PATTERN = /\t/
+  # Maximum integer value for "boundless" operations; equal to MAX_SAFE_INTEGER in JavaScript
+  MAX_INT = 9007199254740991
 
   # The default document type
   # Can influence markup generated by the converters
@@ -243,20 +264,21 @@ module Asciidoctor
     'docbook' => '.xml',
     'pdf' => '.pdf',
     'epub' => '.epub',
+    'manpage' => '.man',
     'asciidoc' => '.adoc'
   }
 
   # Set of file extensions recognized as AsciiDoc documents (stored as a truth hash)
   ASCIIDOC_EXTENSIONS = {
-    '.asciidoc' => true,
     '.adoc' => true,
-    '.ad' => true,
+    '.asciidoc' => true,
     '.asc' => true,
+    '.ad' => true,
     # TODO .txt should be deprecated
     '.txt' => true
   }
 
-  SECTION_LEVELS = {
+  SETEXT_SECTION_LEVELS = {
     '=' => 0,
     '-' => 1,
     '~' => 2,
@@ -266,7 +288,11 @@ module Asciidoctor
 
   ADMONITION_STYLES = ['NOTE', 'TIP', 'IMPORTANT', 'WARNING', 'CAUTION'].to_set
 
-  PARAGRAPH_STYLES = ['comment', 'example', 'literal', 'listing', 'normal', 'pass', 'quote', 'sidebar', 'source', 'verse', 'abstract', 'partintro'].to_set
+  ADMONITION_STYLE_HEADS = ['N', 'T', 'I', 'W', 'C'].to_set
+
+  CALLOUT_LIST_HEADS = ['<', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0'].to_set
+
+  PARAGRAPH_STYLES = ['comment', 'example', 'literal', 'listing', 'normal', 'open', 'pass', 'quote', 'sidebar', 'source', 'verse', 'abstract', 'partintro'].to_set
 
   VERBATIM_STYLES = ['literal', 'listing', 'source', 'verse'].to_set
 
@@ -287,15 +313,20 @@ module Asciidoctor
     '```'  => [:fenced_code, ::Set.new]
   }
 
-  DELIMITED_BLOCK_LEADERS = DELIMITED_BLOCKS.keys.map {|key| key[0..1] }.to_set
+  DELIMITED_BLOCK_HEADS = DELIMITED_BLOCKS.keys.map {|key| key.slice 0, 2 }.to_set
 
-  LAYOUT_BREAK_LINES = {
+  LAYOUT_BREAK_CHARS = {
     '\'' => :thematic_break,
-    '-'  => :thematic_break,
-    '*'  => :thematic_break,
-    '_'  => :thematic_break,
     '<'  => :page_break
   }
+
+  MARKDOWN_THEMATIC_BREAK_CHARS = {
+    '-'  => :thematic_break,
+    '*'  => :thematic_break,
+    '_'  => :thematic_break
+  }
+
+  HYBRID_LAYOUT_BREAK_CHARS = LAYOUT_BREAK_CHARS.merge MARKDOWN_THEMATIC_BREAK_CHARS
 
   #LIST_CONTEXTS = [:ulist, :olist, :dlist, :colist]
 
@@ -305,37 +336,49 @@ module Asciidoctor
   ORDERED_LIST_STYLES = [:arabic, :loweralpha, :lowerroman, :upperalpha, :upperroman] #, :lowergreek]
 
   ORDERED_LIST_KEYWORDS = {
+    #'arabic'     => '1',
+    #'decimal'    => '1',
     'loweralpha' => 'a',
     'lowerroman' => 'i',
+    #'lowergreek' => 'a',
     'upperalpha' => 'A',
     'upperroman' => 'I'
-    #'lowergreek' => 'a'
-    #'arabic'     => '1'
-    #'decimal'    => '1'
   }
+
+  ATTR_REF_HEAD = '{'
 
   LIST_CONTINUATION = '+'
 
-  # NOTE AsciiDoc Python recognizes both a preceding TAB and a space
-  LINE_BREAK = ' +'
+  # NOTE AsciiDoc Python allows + to be preceded by TAB; Asciidoctor does not
+  HARD_LINE_BREAK = ' +'
 
   LINE_CONTINUATION = ' \\'
 
   LINE_CONTINUATION_LEGACY = ' +'
 
+  MATHJAX_VERSION = '2.7.4'
+
   BLOCK_MATH_DELIMITERS = {
-    :asciimath => ['\\$', '\\$'],
-    :latexmath => ['\\[', '\\]'],
+    :asciimath => ['\$', '\$'],
+    :latexmath => ['\[', '\]'],
   }
 
   INLINE_MATH_DELIMITERS = {
-    :asciimath => ['\\$', '\\$'],
-    :latexmath => ['\\(', '\\)'],
+    :asciimath => ['\$', '\$'],
+    :latexmath => ['\(', '\)'],
   }
+
+  (STEM_TYPE_ALIASES = {
+    'latexmath' => 'latexmath',
+    'latex' => 'latexmath',
+    'tex' => 'latexmath'
+  }).default = 'asciimath'
+
+  FONT_AWESOME_VERSION = '4.7.0'
 
   # attributes which be changed within the content of the document (but not
   # header) because it has semantic meaning; ex. sectnums
-  FLEXIBLE_ATTRIBUTES = %w(sectnums)
+  FLEXIBLE_ATTRIBUTES = ['sectnums']
 
   # A collection of regular expressions used by the parser.
   #
@@ -343,8 +386,8 @@ module Asciidoctor
   # contents between square brackets, ignoring escaped closing brackets
   # (closing brackets prefixed with a backslash '\' character)
   #
-  #   Pattern: (?:\[((?:\\\]|[^\]])*?)\])
-  #   Matches: [enclosed text here] or [enclosed [text\] here]
+  #   Pattern: \[(|.*?[^\\])\]
+  #   Matches: [enclosed text] and [enclosed [text\]], not [enclosed text \\] or [\\] (as these require a trailing space)
   #
   #(pseudo)module Rx
 
@@ -353,26 +396,13 @@ module Asciidoctor
 
     # NOTE \w matches only the ASCII word characters, whereas [[:word:]] or \p{Word} matches any character in the Unicode word category.
 
-    # character classes for the Regexp engine(s) in JavaScript
-    if RUBY_ENGINE == 'opal'
-      CC_ALPHA = 'a-zA-Z'
-      CG_ALPHA = '[a-zA-Z]'
-      CC_ALNUM = 'a-zA-Z0-9'
-      CG_ALNUM = '[a-zA-Z0-9]'
-      CG_BLANK = '[ \\t]'
-      CC_EOL   = '(?=\\n|$)'
-      CG_GRAPH = '[\\x21-\\x7E]' # non-blank character
-      CC_ALL   = '[\s\S]' # any character, including newlines (alternatively, [^])
-      CC_WORD  = 'a-zA-Z0-9_'
-      CG_WORD  = '[a-zA-Z0-9_]'
     # character classes for the Regexp engine in Ruby >= 2 (Ruby 1.9 supports \p{} but has problems w/ encoding)
-    elsif ::RUBY_MIN_VERSION_2
+    if ::RUBY_MIN_VERSION_2
       CC_ALPHA = CG_ALPHA = '\p{Alpha}'
       CC_ALNUM = CG_ALNUM = '\p{Alnum}'
       CC_ALL   = '.'
       CG_BLANK = '\p{Blank}'
       CC_EOL   = '$'
-      CG_GRAPH = '\p{Graph}'
       CC_WORD  = CG_WORD = '\p{Word}'
     # character classes for the Regexp engine in Ruby < 2
     else
@@ -381,18 +411,18 @@ module Asciidoctor
       CC_ALL   = '.'
       CC_ALNUM = '[:alnum:]'
       CG_ALNUM = '[[:alnum:]]'
-      CG_BLANK = '[[:blank:]]'
       CC_EOL   = '$'
-      CG_GRAPH = '[[:graph:]]' # non-blank character
       if ::RUBY_MIN_VERSION_1_9
+        CG_BLANK = '[[:blank:]]'
         CC_WORD = '[:word:]'
         CG_WORD = '[[:word:]]'
       else
         # NOTE Ruby 1.8 cannot match word characters beyond the ASCII range; if you need this feature, upgrade!
+        CG_BLANK = '[ \t]'
         CC_WORD = '[:alnum:]_'
         CG_WORD = '[[:alnum:]_]'
       end
-    end
+    end unless RUBY_ENGINE == 'opal'
 
     ## Document header
 
@@ -410,17 +440,21 @@ module Asciidoctor
     #
     # Examples
     #
+    #   v1.0
+    #   2013-01-01
     #   v1.0, 2013-01-01: Ring in the new year release
+    #   1.0, Jan 01, 2013
     #
-    RevisionInfoLineRx = /^(?:\D*(.*?),)?(?:\s*(?!:)(.*?))(?:\s*(?!^):\s*(.*))?$/
+    RevisionInfoLineRx = /^(?:[^\d{]*(.*?),)? *(?!:)(.*?)(?: *(?!^),?: *(.*))?$/
 
     # Matches the title and volnum in the manpage doctype.
     #
     # Examples
     #
-    #   = asciidoctor ( 1 ) 
+    #   = asciidoctor(1)
+    #   = asciidoctor ( 1 )
     #
-    ManpageTitleVolnumRx = /^(.*)\((.*)\)$/
+    ManpageTitleVolnumRx = /^(.+?) *\( *(.+?) *\)$/
 
     # Matches the name and purpose in the manpage doctype.
     #
@@ -428,7 +462,7 @@ module Asciidoctor
     #
     #   asciidoctor - converts AsciiDoc source files to HTML, DocBook and other formats
     #
-    ManpageNamePurposeRx = /^(.*?)#{CG_BLANK}+-#{CG_BLANK}+(.*)$/
+    ManpageNamePurposeRx = /^(.+?) +- +(.+)$/
 
     ## Preprocessor directives
 
@@ -444,7 +478,7 @@ module Asciidoctor
     #   endif::basebackend-html[]
     #   endif::[]
     #
-    ConditionalDirectiveRx = /^\\?(ifdef|ifndef|ifeval|endif)::(\S*?(?:([,\+])\S+?)?)\[(.+)?\]$/
+    ConditionalDirectiveRx = /^(\\)?(ifdef|ifndef|ifeval|endif)::(\S*?(?:([,+])\S*?)?)\[(.+)?\]$/
 
     # Matches a restricted (read as safe) eval expression.
     #
@@ -452,7 +486,7 @@ module Asciidoctor
     #
     #   "{asciidoctor-version}" >= "0.1.0"
     #
-    EvalExpressionRx = /^(\S.*?)#{CG_BLANK}*(==|!=|<=|>=|<|>)#{CG_BLANK}*(\S.*)$/
+    EvalExpressionRx = /^(.+?) *([=!><]=|[><]) *(.+)$/
 
     # Matches an include preprocessor directive.
     #
@@ -461,7 +495,7 @@ module Asciidoctor
     #   include::chapter1.ad[]
     #   include::example.txt[lines=1;2;5..10]
     #
-    IncludeDirectiveRx = /^\\?include::([^\[]+)\[(.*?)\]$/
+    IncludeDirectiveRx = /^(\\)?include::([^\[][^\[]*)\[(.+)?\]$/
 
     # Matches a trailing tag directive in an include file.
     #
@@ -474,7 +508,8 @@ module Asciidoctor
     #     log(e);
     #   }
     #   // end::try-catch[]
-    TagDirectiveRx = /\b(?:tag|end)::\S+\[\]$/
+    # NOTE m flag is required for Asciidoctor.js
+    TagDirectiveRx = /\b(?:tag|(e)nd)::(\S+?)\[\](?=$|[ \r])/m
 
     ## Attribute entries and references
 
@@ -486,34 +521,41 @@ module Asciidoctor
     #   :First Name: Dan
     #   :sectnums!:
     #   :!toc:
-    #   :long-entry: Attribute value lines ending in ' +'
-    #                are joined together as a single value,
-    #                collapsing the line breaks and indentation to
+    #   :long-entry: Attribute value lines ending in ' \' \
+    #                are joined together as a single value, \
+    #                collapsing the line breaks and indentation to \
     #                a single space.
     #
-    AttributeEntryRx = /^:(!?\w.*?):(?:#{CG_BLANK}+(.*))?$/
+    AttributeEntryRx = /^:(!?#{CG_WORD}[^:]*):(?:[ \t]+(.*))?$/
 
     # Matches invalid characters in an attribute name.
-    InvalidAttributeNameCharsRx = /[^\w\-]/
+    InvalidAttributeNameCharsRx = /[^-#{CC_WORD}]/
 
-    # Matches the pass inline macro allowed in value of attribute assignment.
+    # Matches a pass inline macro that surrounds the value of an attribute
+    # entry once it has been parsed.
     #
     # Examples
     #
     #   pass:[text]
+    #   pass:a[{a} {b} {c}]
     #
-    AttributeEntryPassMacroRx = /^pass:([a-z,]*)\[(.*)\]$/
+    if RUBY_ENGINE == 'opal'
+      # In JavaScript, ^ and $ match the boundaries of the string when the m flag is not set
+      AttributeEntryPassMacroRx = /^pass:([a-z]+(?:,[a-z]+)*)?\[([\S\s]*)\]$/
+    else
+      AttributeEntryPassMacroRx = /\Apass:([a-z]+(?:,[a-z]+)*)?\[(.*)\]\Z/m
+    end
 
     # Matches an inline attribute reference.
     #
     # Examples
     #
-    #   {foo}
-    #   {counter:pcount:1}
+    #   {foobar} or {app_name} or {product-version}
+    #   {counter:sequence-name:1}
     #   {set:foo:bar}
     #   {set:name!}
     #
-    AttributeReferenceRx = /(\\)?\{((set|counter2?):.+?|\w+(?:[\-]\w+)*)(\\)?\}/
+    AttributeReferenceRx = /(\\)?\{(#{CG_WORD}[-#{CC_WORD}]*|(set|counter2?):.+?)(\\)?\}/
 
     ## Paragraphs and delimited blocks
 
@@ -524,7 +566,7 @@ module Asciidoctor
     #   [[idname]]
     #   [[idname,Reference Text]]
     #
-    BlockAnchorRx = /^\[\[(?:|([#{CC_ALPHA}:_][#{CC_WORD}:.-]*)(?:,#{CG_BLANK}*(\S.*))?)\]\]$/
+    BlockAnchorRx = /^\[\[(?:|([#{CC_ALPHA}_:][#{CC_WORD}:.-]*)(?:, *(.+))?)\]\]$/
 
     # Matches an attribute list above a block element.
     #
@@ -539,12 +581,12 @@ module Asciidoctor
     #   # as attribute reference
     #   [{lead}]
     #
-    BlockAttributeListRx = /^\[(|#{CG_BLANK}*[#{CC_WORD}\{,.#"'%].*)\]$/
+    BlockAttributeListRx = /^\[(|[#{CC_WORD}.#%{,"'].*)\]$/
 
     # A combined pattern that matches either a block anchor or a block attribute list.
     #
     # TODO this one gets hit a lot, should be optimized as much as possible
-    BlockAttributeLineRx = /^\[(|#{CG_BLANK}*[#{CC_WORD}\{,.#"'%].*|\[(?:|[#{CC_ALPHA}:_][#{CC_WORD}:.-]*(?:,#{CG_BLANK}*\S.*)?)\])\]$/
+    BlockAttributeLineRx = /^\[(?:|[#{CC_WORD}.#%{,"'].*|\[(?:|[#{CC_ALPHA}_:][#{CC_WORD}:.-]*(?:, *.+)?)\])\]$/
 
     # Matches a title above a block.
     #
@@ -552,7 +594,7 @@ module Asciidoctor
     #
     #   .Title goes here
     #
-    BlockTitleRx = /^\.([^\s.].*)$/
+    BlockTitleRx = /^\.(\.?[^ \t.].*)$/
 
     # Matches an admonition label at the start of a paragraph.
     #
@@ -561,7 +603,7 @@ module Asciidoctor
     #   NOTE: Just a little note.
     #   TIP: Don't forget!
     #
-    AdmonitionParagraphRx = /^(#{ADMONITION_STYLES.to_a * '|'}):#{CG_BLANK}/
+    AdmonitionParagraphRx = /^(#{ADMONITION_STYLES.to_a.join '|'}):[ \t]+/
 
     # Matches a literal paragraph, which is a line of text preceded by at least one space.
     #
@@ -569,7 +611,7 @@ module Asciidoctor
     #
     #   <SPACE>Foo
     #   <TAB>Foo
-    LiteralParagraphRx = /^(#{CG_BLANK}+.*)$/
+    LiteralParagraphRx = /^([ \t]+.*)$/
 
     # Matches a comment block.
     #
@@ -579,44 +621,36 @@ module Asciidoctor
     #   This is a block comment.
     #   It can span one or more lines.
     #   ////
-    CommentBlockRx = %r{^/{4,}$}
+    #CommentBlockRx = %r(^/{4,}$)
 
     # Matches a comment line.
     #
     # Examples
     #
-    #   // an then whatever
+    #   // note to author
     #
-    CommentLineRx = %r{^//(?:[^/]|$)}
+    #CommentLineRx = %r(^//(?=[^/]|$))
 
     ## Section titles
 
-    # Matches a single-line (Atx-style) section title.
+    # Matches an Atx (single-line) section title.
     #
     # Examples
     #
     #   == Foo
-    #   # ^ a level 1 (h2) section title
+    #   // ^ a level 1 (h2) section title
     #
     #   == Foo ==
-    #   # ^ also a level 1 (h2) section title
+    #   // ^ also a level 1 (h2) section title
     #
-    # match[1] is the delimiter, whose length determines the level
-    # match[2] is the title itself
-    # match[3] is an inline anchor, which becomes the section id
-    AtxSectionRx = /^((?:=|#){1,6})#{CG_BLANK}+(\S.*?)(?:#{CG_BLANK}+\1)?$/
+    AtxSectionTitleRx = /^(=={0,5})[ \t]+(.+?)(?:[ \t]+\1)?$/
 
-    # Matches the restricted section name for a two-line (Setext-style) section title.
-    # The name cannot begin with a dot and has at least one alphanumeric character.
-    SetextSectionTitleRx = /^((?=.*#{CG_WORD}+.*)[^.].*?)$/
+    # Matches an extended Atx section title that includes support for the Markdown variant.
+    ExtAtxSectionTitleRx = /^(=={0,5}|#\#{0,5})[ \t]+(.+?)(?:[ \t]+\1)?$/
 
-    # Matches the underline in a two-line (Setext-style) section title.
-    #
-    # Examples
-    #
-    #   ======  || ------ || ~~~~~~ || ^^^^^^ || ++++++
-    #
-    SetextSectionLineRx = /^(?:=|-|~|\^|\+)+$/
+    # Matches the title only (first line) of an Setext (two-line) section title.
+    # The title cannot begin with a dot and must have at least one alphanumeric character.
+    SetextSectionTitleRx = /^((?!\.).*?#{CG_WORD}.*)$/
 
     # Matches an anchor (i.e., id + optional reference text) inside a section title.
     #
@@ -625,24 +659,19 @@ module Asciidoctor
     #   Section Title [[idname]]
     #   Section Title [[idname,Reference Text]]
     #
-    InlineSectionAnchorRx = /^(.*?)#{CG_BLANK}+(\\)?\[\[([#{CC_ALPHA}:_][#{CC_WORD}:.-]*)(?:,#{CG_BLANK}*(\S.*?))?\]\]$/
+    InlineSectionAnchorRx = / (\\)?\[\[([#{CC_ALPHA}_:][#{CC_WORD}:.-]*)(?:, *(.+))?\]\]$/
 
-    # Matches invalid characters in a section id.
-    InvalidSectionIdCharsRx = /&(?:[a-zA-Z]{2,}|#\d{2,5}|#x[a-fA-F0-9]{2,4});|[^#{CC_WORD}]+?/
-
-    # Matches the block style used to designate a section title as a floating title.
+    # Matches invalid ID characters in a section title.
     #
-    # Examples
-    #
-    #   [float]
-    #   = Floating Title
-    #
-    FloatingTitleStyleRx = /^(?:float|discrete)\b/
+    # NOTE uppercase chars not included since expression is only run on a lowercase string
+    InvalidSectionIdCharsRx = /<[^>]+>|&(?:[a-z][a-z]+\d{0,2}|#\d\d\d{0,4}|#x[\da-f][\da-f][\da-f]{0,3});|[^ #{CC_WORD}\-.]+?/
 
     ## Lists
 
     # Detects the start of any list item.
-    AnyListRx = /^(?:<?\d+>#{CG_BLANK}+#{CG_GRAPH}|#{CG_BLANK}*(?:-|(?:\*|\.){1,5}|\d+\.|[a-zA-Z]\.|[IVXivx]+\))#{CG_BLANK}+#{CG_GRAPH}|#{CG_BLANK}*.*?(?::{2,4}|;;)(?:#{CG_BLANK}+#{CG_GRAPH}|$))/
+    #
+    # NOTE we only have to check as far as the blank character because we know it means non-whitespace follows.
+    AnyListRx = /^(?:[ \t]*(?:-|\*\*{0,4}|\.\.{0,4}|\u2022\u2022{0,4}|\d+\.|[a-zA-Z]\.|[IVXivx]+\))[ \t]|[ \t]*.*?(?::::{0,2}|;;)(?:$|[ \t])|<?\d+>[ \t])/
 
     # Matches an unordered list item (one level for hyphens, up to 5 levels for asterisks).
     #
@@ -651,7 +680,8 @@ module Asciidoctor
     #   * Foo
     #   - Foo
     #
-    UnorderedListRx = /^#{CG_BLANK}*(-|\*{1,5})#{CG_BLANK}+(.*)$/
+    # NOTE we know trailing (.*) will match at least one character because we strip trailing spaces
+    UnorderedListRx = /^[ \t]*(-|\*\*{0,4}|\u2022\u2022{0,4})[ \t]+(.*)$/
 
     # Matches an ordered list item (explicit numbering or up to 5 consecutive dots).
     #
@@ -666,11 +696,12 @@ module Asciidoctor
     #   I. Foo (upperroman)
     #
     # NOTE leading space match is not always necessary, but is used for list reader
-    OrderedListRx = /^#{CG_BLANK}*(\.{1,5}|\d+\.|[a-zA-Z]\.|[IVXivx]+\))#{CG_BLANK}+(.*)$/
+    # NOTE we know trailing (.*) will match at least one character because we strip trailing spaces
+    OrderedListRx = /^[ \t]*(\.\.{0,4}|\d+\.|[a-zA-Z]\.|[IVXivx]+\))[ \t]+(.*)$/
 
     # Matches the ordinals for each type of ordered list.
     OrderedListMarkerRxMap = {
-      :arabic => /\d+[.>]/,
+      :arabic => /\d+\./,
       :loweralpha => /[a-z]\./,
       :lowerroman => /[ivx]+\)/,
       :upperalpha => /[A-Z]\./,
@@ -678,40 +709,39 @@ module Asciidoctor
       #:lowergreek => /[a-z]\]/
     }
 
-    # Matches a definition list item.
+    # Matches a description list entry.
     #
     # Examples
     #
     #   foo::
-    #   foo:::
-    #   foo::::
-    #   foo;;
+    #   bar:::
+    #   baz::::
+    #   blah;;
     #
-    #   # should be followed by a definition, on the same line...
+    #   # the term may be followed by a description on the same line...
     #
-    #   foo:: That which precedes 'bar' (see also, <<bar>>)
+    #   foo:: The metasyntactic variable that commonly accompanies 'bar' (see also, <<bar>>).
     #
-    #   # ...or on a separate line
+    #   # ...or on a separate line, which may optionally be indented
     #
     #   foo::
-    #     That which precedes 'bar' (see also, <<bar>>)
+    #     The metasyntactic variable that commonly accompanies 'bar' (see also, <<bar>>).
     #
-    #   # the term may be an attribute reference
+    #   # attribute references may be used in both the term and the description
     #
-    #   {foo_term}:: {foo_def}
+    #   {foo-term}:: {foo-desc}
     #
+    # NOTE we know trailing (.*) will match at least one character because we strip trailing spaces
     # NOTE negative match for comment line is intentional since that isn't handled when looking for next list item
-    # QUESTION should we check for line comment in regex or when scanning the lines?
-    # 
-    DefinitionListRx = /^(?!\/\/)#{CG_BLANK}*(.*?)(:{2,4}|;;)(?:#{CG_BLANK}+(.*))?$/
+    # TODO check for line comment when scanning lines instead of in regex
+    DescriptionListRx = %r(^(?!//)[ \t]*(.*?)(:::{0,2}|;;)(?:$|[ \t]+(.*)$))
 
-    # Matches a sibling definition list item (which does not include the keyed type).
-    DefinitionListSiblingRx = {
-      # (?:.*?[^:])? - a non-capturing group which grabs longest sequence of characters that doesn't end w/ colon
-      '::' => /^(?!\/\/)#{CG_BLANK}*((?:.*[^:])?)(::)(?:#{CG_BLANK}+(.*))?$/,
-      ':::' => /^(?!\/\/)#{CG_BLANK}*((?:.*[^:])?)(:::)(?:#{CG_BLANK}+(.*))?$/,
-      '::::' => /^(?!\/\/)#{CG_BLANK}*((?:.*[^:])?)(::::)(?:#{CG_BLANK}+(.*))?$/,
-      ';;' => /^(?!\/\/)#{CG_BLANK}*(.*)(;;)(?:#{CG_BLANK}+(.*))?$/
+    # Matches a sibling description list item (which does not include the type in the key).
+    DescriptionListSiblingRx = {
+      '::' => %r(^(?!//)[ \t]*(.*[^:]|)(::)(?:$|[ \t]+(.*)$)),
+      ':::' => %r(^(?!//)[ \t]*(.*[^:]|)(:::)(?:$|[ \t]+(.*)$)),
+      '::::' => %r(^(?!//)[ \t]*(.*[^:]|)(::::)(?:$|[ \t]+(.*)$)),
+      ';;' => %r(^(?!//)[ \t]*(.*?)(;;)(?:$|[ \t]+(.*)$))
     }
 
     # Matches a callout list item.
@@ -720,26 +750,33 @@ module Asciidoctor
     #
     #   <1> Foo
     #
-    CalloutListRx = /^<?(\d+)>#{CG_BLANK}+(.*)/
+    # NOTE we know trailing (.*) will match at least one character because we strip trailing spaces
+    CalloutListRx = /^<?(\d+)>[ \t]+(.*)$/
+
+    # Detects a potential callout list item.
+    CalloutListSniffRx = /^<?\d+>/
 
     # Matches a callout reference inside literal text.
-    # 
+    #
     # Examples
-    #   <1> (optionally prefixed by //, # or ;; line comment chars)
+    #   <1> (optionally prefixed by //, #, -- or ;; line comment chars)
     #   <1> <2> (multiple callouts on one line)
     #   <!--1--> (for XML-based languages)
     #
-    # NOTE special characters are already be replaced at this point during conversion to an SGML format
-    CalloutConvertRx = /(?:(?:\/\/|#|;;) ?)?(\\)?&lt;!?(--|)(\d+)\2&gt;(?=(?: ?\\?&lt;!?\2\d+\2&gt;)*#{CC_EOL})/
-    # NOTE (con't) ...but not while scanning
-    CalloutQuickScanRx = /\\?<!?(--|)(\d+)\1>(?=(?: ?\\?<!?\1\d+\1>)*#{CC_EOL})/
-    CalloutScanRx = /(?:(?:\/\/|#|;;) ?)?(\\)?<!?(--|)(\d+)\2>(?=(?: ?\\?<!?\2\d+\2>)*#{CC_EOL})/
+    # NOTE extract regexps are applied line-by-line, so we can use $ as end-of-line char
+    CalloutExtractRx = %r((?:(?://|#|--|;;) ?)?(\\)?<!?(|--)(\d+)\2>(?=(?: ?\\?<!?\2\d+\2>)*$))
+    CalloutExtractRxt = '(\\\\)?<()(\\d+)>(?=(?: ?\\\\?<\\d+>)*$)'
+    # NOTE special characters have not been replaced when scanning
+    CalloutScanRx = /\\?<!?(|--)(\d+)\1>(?=(?: ?\\?<!?\1\d+\1>)*#{CC_EOL})/
+    # NOTE special characters have already been replaced when converting to an SGML format
+    CalloutSourceRx = %r((?:(?://|#|--|;;) ?)?(\\)?&lt;!?(|--)(\d+)\2&gt;(?=(?: ?\\?&lt;!?\2\d+\2&gt;)*#{CC_EOL}))
+    CalloutSourceRxt = "(\\\\)?&lt;()(\\d+)&gt;(?=(?: ?\\\\?&lt;\\d+&gt;)*#{CC_EOL})"
 
     # A Hash of regexps for lists used for dynamic access.
     ListRxMap = {
       :ulist => UnorderedListRx,
       :olist => OrderedListRx,
-      :dlist => DefinitionListRx,
+      :dlist => DescriptionListRx,
       :colist => CalloutListRx
     }
 
@@ -751,7 +788,7 @@ module Asciidoctor
     #
     #   1*h,2*,^3e
     #
-    ColumnSpecRx = /^(?:(\d+)\*)?([<^>](?:\.[<^>]?)?|(?:[<^>]?\.)?[<^>])?(\d+%?)?([a-z])?$/
+    ColumnSpecRx = /^(?:(\d+)\*)?([<^>](?:\.[<^>]?)?|(?:[<^>]?\.)?[<^>])?(\d+%?|~)?([a-z])?$/
 
     # Parses the start and end of a cell spec (i.e., cellspec) for a table.
     #
@@ -760,20 +797,20 @@ module Asciidoctor
     #   2.3+<.>m
     #
     # FIXME use step-wise scan (or treetop) rather than this mega-regexp
-    CellSpecStartRx = /^#{CG_BLANK}*(?:(\d+(?:\.\d*)?|(?:\d*\.)?\d+)([*+]))?([<^>](?:\.[<^>]?)?|(?:[<^>]?\.)?[<^>])?([a-z])?$/
-    CellSpecEndRx = /#{CG_BLANK}+(?:(\d+(?:\.\d*)?|(?:\d*\.)?\d+)([*+]))?([<^>](?:\.[<^>]?)?|(?:[<^>]?\.)?[<^>])?([a-z])?$/
+    CellSpecStartRx = /^[ \t]*(?:(\d+(?:\.\d*)?|(?:\d*\.)?\d+)([*+]))?([<^>](?:\.[<^>]?)?|(?:[<^>]?\.)?[<^>])?([a-z])?$/
+    CellSpecEndRx = /[ \t]+(?:(\d+(?:\.\d*)?|(?:\d*\.)?\d+)([*+]))?([<^>](?:\.[<^>]?)?|(?:[<^>]?\.)?[<^>])?([a-z])?$/
 
     # Block macros
 
-    # Matches the general block macro pattern.
+    # Matches the custom block macro pattern.
     #
     # Examples
-    # 
+    #
     #   gist::123456[]
     #
     #--
     # NOTE we've relaxed the match for target to accomodate the short format (e.g., name::[attrlist])
-    GenericBlockMacroRx = /^(#{CG_WORD}+)::(\S*?)\[((?:\\\]|[^\]])*?)\]$/
+    CustomBlockMacroRx = /^(#{CG_WORD}[-#{CC_WORD}]*)::(|\S|\S.*?\S)\[(.+)?\]$/
 
     # Matches an image, video or audio block macro.
     #
@@ -782,7 +819,7 @@ module Asciidoctor
     #   image::filename.png[Caption]
     #   video::http://youtube.com/12345[Cats vs Dogs]
     #
-    MediaBlockMacroRx = /^(image|video|audio)::(\S+?)\[((?:\\\]|[^\]])*?)\]$/
+    BlockMediaMacroRx = /^(image|video|audio)::(\S|\S.*?\S)\[(.+)?\]$/
 
     # Matches the TOC block macro.
     #
@@ -791,7 +828,7 @@ module Asciidoctor
     #   toc::[]
     #   toc::[levels=2]
     #
-    TocBlockMacroRx = /^toc::\[(.*?)\]$/
+    BlockTocMacroRx = /^toc::\[(.+)?\]$/
 
     ## Inline macros
 
@@ -804,30 +841,38 @@ module Asciidoctor
     #   anchor:idname[]
     #   anchor:idname[Reference Text]
     #
-    InlineAnchorRx = /\\?(?:\[\[([#{CC_ALPHA}:_][#{CC_WORD}:.-]*)(?:,#{CG_BLANK}*(\S.*?))?\]\]|anchor:(\S+)\[(.*?[^\\])?\])/
+    InlineAnchorRx = /(\\)?(?:\[\[([#{CC_ALPHA}_:][#{CC_WORD}:.-]*)(?:, *(.+?))?\]\]|anchor:([#{CC_ALPHA}_:][#{CC_WORD}:.-]*)\[(?:\]|(.*?[^\\])\]))/
 
-    # Matches a bibliography anchor anywhere inline.
+    # Scans for a non-escaped anchor (i.e., id + optional reference text) in the flow of text.
+    InlineAnchorScanRx = /(?:^|[^\\\[])\[\[([#{CC_ALPHA}_:][#{CC_WORD}:.-]*)(?:, *(.+?))?\]\]|(?:^|[^\\])anchor:([#{CC_ALPHA}_:][#{CC_WORD}:.-]*)\[(?:\]|(.*?[^\\])\])/
+
+    # Scans for a leading, non-escaped anchor (i.e., id + optional reference text).
+    LeadingInlineAnchorRx = /^\[\[([#{CC_ALPHA}_:][#{CC_WORD}:.-]*)(?:, *(.+?))?\]\]/
+
+    # Matches a bibliography anchor at the start of the list item text (in a bibliography list).
     #
     # Examples
     #
-    #   [[[Foo]]]
+    #   [[[Fowler_1997]]] Fowler M. ...
     #
-    InlineBiblioAnchorRx = /\\?\[\[\[([#{CC_WORD}:][#{CC_WORD}:.-]*?)\]\]\]/
+    InlineBiblioAnchorRx = /^\[\[\[([#{CC_ALPHA}_:][#{CC_WORD}:.-]*)(?:, *(.+?))?\]\]\]/
 
     # Matches an inline e-mail address.
     #
     #   doc.writer@example.com
     #
-    EmailInlineMacroRx = /([\\>:\/])?#{CG_WORD}[#{CC_WORD}.%+-]*@#{CG_ALNUM}[#{CC_ALNUM}.-]*\.#{CG_ALPHA}{2,4}\b/
+    InlineEmailRx = %r(([\\>:/])?#{CG_WORD}[#{CC_WORD}.%+-]*@#{CG_ALNUM}[#{CC_ALNUM}.-]*\.#{CG_ALPHA}{2,4}\b)
 
     # Matches an inline footnote macro, which is allowed to span multiple lines.
     #
     # Examples
-    #   footnote:[text]
-    #   footnoteref:[id,text]
-    #   footnoteref:[id]
+    #   footnote:[text] (not referenceable)
+    #   footnote:id[text] (referenceable)
+    #   footnote:id[] (reference)
+    #   footnoteref:[id,text] (legacy)
+    #   footnoteref:[id] (legacy)
     #
-    FootnoteInlineMacroRx = /\\?(footnote(?:ref)?):\[(#{CC_ALL}*?[^\\])\]/m
+    InlineFootnoteMacroRx = /\\?footnote(?:(ref):|:([\w-]+)?)\[(?:|(#{CC_ALL}*?[^\\]))\]/m
 
     # Matches an image or icon inline macro.
     #
@@ -838,7 +883,8 @@ module Asciidoctor
     #   image:filename.png[More [Alt\] Text] (alt text becomes "More [Alt] Text")
     #   icon:github[large]
     #
-    ImageInlineMacroRx = /\\?(?:image|icon):([^:\[][^\[]*)\[((?:\\\]|[^\]])*?)\]/
+    # NOTE be as non-greedy as possible by not allowing endline or left square bracket in target
+    InlineImageMacroRx = /\\?i(?:mage|con):([^:\s\[](?:[^\n\[]*[^\s\[])?)\[(|#{CC_ALL}*?[^\\])\]/m
 
     # Matches an indexterm inline macro, which may span multiple lines.
     #
@@ -849,7 +895,7 @@ module Asciidoctor
     #   indexterm2:[Tigers]
     #   ((Tigers))
     #
-    IndextermInlineMacroRx = /\\?(?:(indexterm2?):\[(#{CC_ALL}*?[^\\])\]|\(\((#{CC_ALL}+?)\)\)(?!\)))/m
+    InlineIndextermMacroRx = /\\?(?:(indexterm2?):\[(#{CC_ALL}*?[^\\])\]|\(\((#{CC_ALL}+?)\)\)(?!\)))/m
 
     # Matches either the kbd or btn inline macro.
     #
@@ -861,26 +907,19 @@ module Asciidoctor
     #   kbd:[Ctrl,T]
     #   btn:[Save]
     #
-    KbdBtnInlineMacroRx = /\\?(?:kbd|btn):\[((?:\\\]|[^\]])+?)\]/
-
-    # Matches the delimiter used for kbd value.
-    #
-    # Examples
-    #
-    #   Ctrl + Alt+T
-    #   Ctrl,T
-    #
-    KbdDelimiterRx = /(?:\+|,)(?=#{CG_BLANK}*[^\1])/
+    InlineKbdBtnMacroRx = /(\\)?(kbd|btn):\[(#{CC_ALL}*?[^\\])\]/m
 
     # Matches an implicit link and some of the link inline macro.
     #
     # Examples
-    # 
-    #   http://github.com
-    #   http://github.com[GitHub]
+    #
+    #   https://github.com
+    #   https://github.com[GitHub]
+    #   <https://github.com>
+    #   link:https://github.com[]
     #
     # FIXME revisit! the main issue is we need different rules for implicit vs explicit
-    LinkInlineRx = %r{(^|link:|&lt;|[\s>\(\)\[\];])(\\?(?:https?|file|ftp|irc)://[^\s\[\]<]*[^\s.,\[\]<])(?:\[((?:\\\]|[^\]])*?)\])?}
+    InlineLinkRx = %r((^|link:|#{CG_BLANK}|&lt;|[>\(\)\[\];])(\\?(?:https?|file|ftp|irc)://[^\s\[\]<]*[^\s.,\[\]<])(?:\[(|#{CC_ALL}*?[^\\])\])?)m
 
     # Match a link or e-mail inline macro.
     #
@@ -889,7 +928,12 @@ module Asciidoctor
     #   link:path[label]
     #   mailto:doc.writer@example.com[]
     #
-    LinkInlineMacroRx = /\\?(?:link|mailto):([^\s\[]+)(?:\[((?:\\\]|[^\]])*?)\])/
+    # NOTE be as non-greedy as possible by not allowing space or left square bracket in target
+    InlineLinkMacroRx = /\\?(?:link|(mailto)):(|[^:\s\[][^\s\[]*)\[(|#{CC_ALL}*?[^\\])\]/m
+
+    # Matches the name of a macro.
+    #
+    MacroNameRx = /^#{CG_WORD}[-#{CC_WORD}]*$/
 
     # Matches a stem (and alternatives, asciimath and latexmath) inline macro, which may span multiple lines.
     #
@@ -899,17 +943,17 @@ module Asciidoctor
     #   asciimath:[x != 0]
     #   latexmath:[\sqrt{4} = 2]
     #
-    StemInlineMacroRx = /\\?(stem|(?:latex|ascii)math):([a-z,]*)\[(#{CC_ALL}*?[^\\])\]/m
+    InlineStemMacroRx = /\\?(stem|(?:latex|ascii)math):([a-z]+(?:,[a-z]+)*)?\[(#{CC_ALL}*?[^\\])\]/m
 
     # Matches a menu inline macro.
     #
     # Examples
     #
-    #   menu:File[New...]
+    #   menu:File[Save As...]
     #   menu:View[Page Style > No Style]
     #   menu:View[Page Style, No Style]
     #
-    MenuInlineMacroRx = /\\?menu:(#{CG_WORD}|#{CG_WORD}.*?\S)\[#{CG_BLANK}*(.+?)?\]/
+    InlineMenuMacroRx = /\\?menu:(#{CG_WORD}|[#{CC_WORD}&][^\n\[]*[^\s\[])\[ *(#{CC_ALL}*?[^\\])?\]/m
 
     # Matches an implicit menu inline macro.
     #
@@ -917,9 +961,9 @@ module Asciidoctor
     #
     #   "File > New..."
     #
-    MenuInlineRx = /\\?"(#{CG_WORD}[^"]*?#{CG_BLANK}*&gt;#{CG_BLANK}*[^" \t][^"]*)"/
+    InlineMenuRx = /\\?"([#{CC_WORD}&][^"]*?[ \n]+&gt;[ \n]+[^"]*)"/
 
-    # Matches an inline passthrough value, which may span multiple lines.
+    # Matches an inline passthrough, which may span multiple lines.
     #
     # Examples
     #
@@ -927,10 +971,19 @@ module Asciidoctor
     #   `text` (compat)
     #
     # NOTE we always capture the attributes so we know when to use compatible (i.e., legacy) behavior
-    PassInlineRx = {
-      false => ['+', '`', /(^|[^#{CC_WORD};:])(?:\[([^\]]+?)\])?(\\?(\+|`)(\S|\S#{CC_ALL}*?\S)\4)(?!#{CC_WORD})/m],
-      true  => ['`', nil, /(^|[^`#{CC_WORD}])(?:\[([^\]]+?)\])?(\\?(`)([^`\s]|[^`\s]#{CC_ALL}*?\S)\4)(?![`#{CC_WORD}])/m]
+    InlinePassRx = {
+      false => ['+', '`', /(^|[^#{CC_WORD};:])(?:\[([^\]]+)\])?(\\?(\+|`)(\S|\S#{CC_ALL}*?\S)\4)(?!#{CG_WORD})/m],
+      true  => ['`', nil, /(^|[^`#{CC_WORD}])(?:\[([^\]]+)\])?(\\?(`)([^`\s]|[^`\s]#{CC_ALL}*?\S)\4)(?![`#{CC_WORD}])/m]
     }
+
+    # Matches an inline plus passthrough spanning multiple lines, but only when it occurs directly
+    # inside constrained monospaced formatting in non-compat mode.
+    #
+    # Examples
+    #
+    #   +text+
+    #
+    SinglePlusInlinePassRx = /^(\\)?\+(\S|\S#{CC_ALL}*?\S)\+$/m
 
     # Matches several variants of the passthrough inline macro, which may span multiple lines.
     #
@@ -940,7 +993,8 @@ module Asciidoctor
     #   $$text$$
     #   pass:quotes[text]
     #
-    PassInlineMacroRx = /(?:(?:(\\?)\[([^\]]+?)\])?(\\{0,2})(\+{2,3}|\${2})(#{CC_ALL}*?)\4|(\\?)pass:([a-z,]*)\[(#{CC_ALL}*?[^\\])\])/m
+    # NOTE we have to support an empty pass:[] for compatibility with AsciiDoc Python
+    InlinePassMacroRx = /(?:(?:(\\?)\[([^\]]+)\])?(\\{0,2})(\+\+\+?|\$\$)(#{CC_ALL}*?)\4|(\\?)pass:([a-z]+(?:,[a-z]+)*)?\[(|#{CC_ALL}*?[^\\])\])/m
 
     # Matches an xref (i.e., cross-reference) inline macro, which may span multiple lines.
     #
@@ -950,51 +1004,61 @@ module Asciidoctor
     #   xref:id[reftext]
     #
     # NOTE special characters have already been escaped, hence the entity references
-    XrefInlineMacroRx = /\\?(?:&lt;&lt;([#{CC_WORD}":]#{CC_ALL}*?)&gt;&gt;|xref:([#{CC_WORD}":]#{CC_ALL}*?)\[(#{CC_ALL}*?)\])/m
+    # NOTE { is included in start characters to support target that begins with attribute reference in title content
+    InlineXrefMacroRx = %r(\\?(?:&lt;&lt;([#{CC_WORD}#/.:{]#{CC_ALL}*?)&gt;&gt;|xref:([#{CC_WORD}#/.:{]#{CC_ALL}*?)\[(?:\]|(#{CC_ALL}*?[^\\])\])))m
 
     ## Layout
 
     # Matches a trailing + preceded by at least one space character,
-    # which forces a hard line break (<br> tag in HTML outputs).
+    # which forces a hard line break (<br> tag in HTML output).
+    #
+    # NOTE AsciiDoc Python allows + to be preceded by TAB; Asciidoctor does not
     #
     # Examples
     #
-    #    +
-    #   Foo +
+    #   Humpty Dumpty sat on a wall, +
+    #   Humpty Dumpty had a great fall.
     #
     if RUBY_ENGINE == 'opal'
-      # NOTE JavaScript only treats ^ and $ as line boundaries in multiline regexp; . won't match newlines
-      LineBreakRx = /^(.*)[ \t]\+$/m
+      # NOTE In Ruby, ^ and $ always match start and end of line, respectively; JavaScript only does so in multiline mode
+      HardLineBreakRx = /^(.*) \+$/m
     else
-      LineBreakRx = /^(.*)[[:blank:]]\+$/
+      HardLineBreakRx = /^(.*) \+$/
     end
 
-    # Matches an AsciiDoc horizontal rule or AsciiDoc page break.
+    # Matches a Markdown horizontal rule.
     #
     # Examples
     #
-    #   ''' (horizontal rule)
-    #   <<< (page break)
+    #   --- or - - -
+    #   *** or * * *
+    #   ___ or _ _ _
     #
-    LayoutBreakLineRx = /^('|<){3,}$/
+    MarkdownThematicBreakRx = /^ {0,3}([-*_])( *)\1\2\1$/
 
     # Matches an AsciiDoc or Markdown horizontal rule or AsciiDoc page break.
     #
     # Examples
     #
-    #   ''' or ' ' ' (horizontal rule)
-    #   --- or - - - (horizontal rule)
-    #   *** or * * * (horizontal rule)
+    #   ''' (horizontal rule)
     #   <<< (page break)
+    #   --- or - - - (horizontal rule, Markdown)
+    #   *** or * * * (horizontal rule, Markdown)
+    #   ___ or _ _ _ (horizontal rule, Markdown)
     #
-    LayoutBreakLinePlusRx = /^(?:'|<){3,}$|^ {0,3}([-\*_])( *)\1\2\1$/
+    ExtLayoutBreakRx = /^(?:'{3,}|<{3,}|([-*_])( *)\1\2\1)$/
 
     ## General
 
-    # Matches a blank line.
+    # Matches consecutive blank lines.
     #
-    # NOTE allows for empty space in line as it could be left by the template engine
-    BlankLineRx = /^#{CG_BLANK}*\n/
+    # Examples
+    #
+    #   one
+    #
+    #   two
+    #
+    BlankLineRx = /\n{2,}/
 
     # Matches a comma or semi-colon delimiter.
     #
@@ -1003,33 +1067,7 @@ module Asciidoctor
     #   one,two
     #   three;four
     #
-    DataDelimiterRx = /,|;/ 
-
-    # Matches one or more consecutive digits on a single line.
-    #
-    # Examples
-    #
-    #   29
-    #
-    DigitsRx = /^\d+$/
-
-    # Matches a single-line of text enclosed in double quotes, capturing the quote char and text.
-    #
-    # Examples
-    #
-    #   "Who goes there?"
-    #
-    DoubleQuotedRx = /^("|)(.*)\1$/
-
-    # Matches multiple lines of text enclosed in double quotes, capturing the quote char and text.
-    #
-    # Examples
-    #
-    #   "I am a run-on sentence and I like
-    #   to take up multiple lines and I
-    #   still want to be matched."
-    #
-    DoubleQuotedMultiRx = /^("|)(#{CC_ALL}*)\1$/m
+    DataDelimiterRx = /[,;]/
 
     # Matches one or more consecutive digits at the end of a line.
     #
@@ -1040,21 +1078,28 @@ module Asciidoctor
     #
     TrailingDigitsRx = /\d+$/
 
-    # Matches a space escaped by a backslash.
+    # Matches whitespace (space, tab, newline) escaped by a backslash.
     #
     # Examples
-    # 
-    #   one\ two\ three
     #
-    EscapedSpaceRx = /\\(#{CG_BLANK})/
+    #   three\ blind\ mice
+    #
+    EscapedSpaceRx = /\\([ \t\n])/
 
-    # Matches a space delimiter that's not escaped.
+    # Detects if text is a possible candidate for the replacements substitution.
+    #
+    ReplaceableTextRx = /[&']|--|\.\.\.|\([CRT]M?\)/
+
+    # Matches a whitespace delimiter, a sequence of spaces, tabs, and/or newlines.
+	# Matches the parsing rules of %w strings in Ruby.
     #
     # Examples
     #
-    #   one two	three	four
+    #   one two	 three   four
+    #   five	six
     #
-    SpaceDelimiterRx = /([^\\])#{CG_BLANK}+/
+    # TODO change to /(?<!\\)[ \t\n]+/ after dropping support for Ruby 1.8.7
+    SpaceDelimiterRx = /([^\\])[ \t\n]+/
 
     # Matches a + or - modifier in a subs list
     #
@@ -1062,10 +1107,8 @@ module Asciidoctor
 
     # Matches any character with multibyte support explicitly enabled (length of multibyte char = 1)
     #
-    # NOTE If necessary to hide use of the language modifier (u) from JavaScript, use (Regexp.new '.', false, 'u')
-    #
-    UnicodeCharScanRx = unless RUBY_ENGINE == 'opal'
-      FORCE_UNICODE_LINE_LENGTH ? /./u : nil
+    unless RUBY_ENGINE == 'opal'
+      UnicodeCharScanRx = /./u if FORCE_UNICODE_LINE_LENGTH
     end
 
     # Detects strings that resemble URIs.
@@ -1073,9 +1116,12 @@ module Asciidoctor
     # Examples
     #   http://domain
     #   https://domain
+    #   file:///path
     #   data:info
     #
-    UriSniffRx = %r{^#{CG_ALPHA}[#{CC_ALNUM}.+-]*:/{0,2}}
+    #   not c:/sample.adoc or c:\sample.adoc
+    #
+    UriSniffRx = %r(^#{CG_ALPHA}[#{CC_ALNUM}.+-]+:/{0,2})
 
     # Detects the end of an implicit URI in the text
     #
@@ -1085,36 +1131,10 @@ module Asciidoctor
     #   &gt;http://google.com&lt;
     #   (See http://google.com):
     #
-    UriTerminator = /[);:]$/
+    UriTerminatorRx = /[);:]$/
 
     # Detects XML tags
     XmlSanitizeRx = /<[^>]+>/
-
-    # Unused
-
-    # Detects any fenced block delimiter, including:
-    #   listing, literal, example, sidebar, quote, passthrough, table and fenced code
-    # Does not match open blocks or air quotes
-    # TIP position the most common blocks towards the front of the pattern
-    #BlockDelimiterRx = %r{^(?:(?:-|\.|=|\*|_|\+|/){4,}|[\|,;!]={3,}|(?:`|~){3,}.*)$}
-
-    # Matches an escaped single quote within a word
-    #
-    # Examples
-    #
-    #   Here\'s Johnny!
-    #
-    #EscapedSingleQuoteRx = /(#{CG_WORD})\\'(#{CG_WORD})/
-    # an alternative if our backend generates single-quoted html/xml attributes
-    #EscapedSingleQuoteRx = /(#{CG_WORD}|=)\\'(#{CG_WORD})/
-
-    # Matches whitespace at the beginning of the line
-    #LeadingSpacesRx = /^(#{CG_BLANK}*)/
-
-    # Matches parent directory references at the beginning of a path
-    #LeadingParentDirsRx = /^(?:\.\.\/)*/
-
-    #StripLineWise = /\A(?:\s*\n)?(#{CC_ALL}*?)\s*\z/m
   #end
 
   INTRINSIC_ATTRIBUTES = {
@@ -1125,12 +1145,11 @@ module Asciidoctor
     'asterisk'   => '*',
     'tilde'      => '~',
     'plus'       => '&#43;',
-    'apostrophe' => '\'',
     'backslash'  => '\\',
     'backtick'   => '`',
+    'blank'      => '',
     'empty'      => '',
     'sp'         => ' ',
-    'space'      => ' ',
     'two-colons' => '::',
     'two-semicolons' => ';;',
     'nbsp'       => '&#160;',
@@ -1144,6 +1163,8 @@ module Asciidoctor
     'rdquo'      => '&#8221;',
     'wj'         => '&#8288;',
     'brvbar'     => '&#166;',
+    'pp'         => '&#43;&#43;',
+    'cpp'        => 'C&#43;&#43;',
     'amp'        => '&',
     'lt'         => '<',
     'gt'         => '>'
@@ -1155,57 +1176,57 @@ module Asciidoctor
   # the order in which they are replaced is important
   quote_subs = [
     # **strong**
-    [:strong, :unconstrained, /\\?(?:\[([^\]]+?)\])?\*\*(#{CC_ALL}+?)\*\*/m],
+    [:strong, :unconstrained, /\\?(?:\[([^\]]+)\])?\*\*(#{CC_ALL}+?)\*\*/m],
 
     # *strong*
-    [:strong, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+?)\])?\*(\S|\S#{CC_ALL}*?\S)\*(?!#{CG_WORD})/m],
+    [:strong, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+)\])?\*(\S|\S#{CC_ALL}*?\S)\*(?!#{CG_WORD})/m],
 
     # "`double-quoted`"
-    [:double, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+?)\])?"`(\S|\S#{CC_ALL}*?\S)`"(?!#{CG_WORD})/m],
+    [:double, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+)\])?"`(\S|\S#{CC_ALL}*?\S)`"(?!#{CG_WORD})/m],
 
     # '`single-quoted`'
-    [:single, :constrained, /(^|[^#{CC_WORD};:`}])(?:\[([^\]]+?)\])?'`(\S|\S#{CC_ALL}*?\S)`'(?!#{CG_WORD})/m],
+    [:single, :constrained, /(^|[^#{CC_WORD};:`}])(?:\[([^\]]+)\])?'`(\S|\S#{CC_ALL}*?\S)`'(?!#{CG_WORD})/m],
 
     # ``monospaced``
-    [:monospaced, :unconstrained, /\\?(?:\[([^\]]+?)\])?``(#{CC_ALL}+?)``/m],
+    [:monospaced, :unconstrained, /\\?(?:\[([^\]]+)\])?``(#{CC_ALL}+?)``/m],
 
     # `monospaced`
-    [:monospaced, :constrained, /(^|[^#{CC_WORD};:"'`}])(?:\[([^\]]+?)\])?`(\S|\S#{CC_ALL}*?\S)`(?![#{CC_WORD}"'`])/m],
+    [:monospaced, :constrained, /(^|[^#{CC_WORD};:"'`}])(?:\[([^\]]+)\])?`(\S|\S#{CC_ALL}*?\S)`(?![#{CC_WORD}"'`])/m],
 
     # __emphasis__
-    [:emphasis, :unconstrained, /\\?(?:\[([^\]]+?)\])?__(#{CC_ALL}+?)__/m],
+    [:emphasis, :unconstrained, /\\?(?:\[([^\]]+)\])?__(#{CC_ALL}+?)__/m],
 
     # _emphasis_
-    [:emphasis, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+?)\])?_(\S|\S#{CC_ALL}*?\S)_(?!#{CG_WORD})/m],
+    [:emphasis, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+)\])?_(\S|\S#{CC_ALL}*?\S)_(?!#{CG_WORD})/m],
 
     # ##mark## (referred to in AsciiDoc Python as unquoted)
-    [:mark, :unconstrained, /\\?(?:\[([^\]]+?)\])?##(#{CC_ALL}+?)##/m],
+    [:mark, :unconstrained, /\\?(?:\[([^\]]+)\])?##(#{CC_ALL}+?)##/m],
 
     # #mark# (referred to in AsciiDoc Python as unquoted)
-    [:mark, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+?)\])?#(\S|\S#{CC_ALL}*?\S)#(?!#{CG_WORD})/m],
+    [:mark, :constrained, /(^|[^#{CC_WORD}&;:}])(?:\[([^\]]+)\])?#(\S|\S#{CC_ALL}*?\S)#(?!#{CG_WORD})/m],
 
     # ^superscript^
-    [:superscript, :unconstrained, /\\?(?:\[([^\]]+?)\])?\^(\S+?)\^/],
+    [:superscript, :unconstrained, /\\?(?:\[([^\]]+)\])?\^(\S+?)\^/],
 
     # ~subscript~
-    [:subscript, :unconstrained, /\\?(?:\[([^\]]+?)\])?~(\S+?)~/]
+    [:subscript, :unconstrained, /\\?(?:\[([^\]]+)\])?~(\S+?)~/]
   ]
 
-  compat_quote_subs = quote_subs.dup
+  compat_quote_subs = quote_subs.drop 0
   # ``quoted''
-  compat_quote_subs[2] = [:double, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+?)\])?``(\S|\S#{CC_ALL}*?\S)''(?!#{CG_WORD})/m]
+  compat_quote_subs[2] = [:double, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+)\])?``(\S|\S#{CC_ALL}*?\S)''(?!#{CG_WORD})/m]
   # `quoted'
-  compat_quote_subs[3] = [:single, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+?)\])?`(\S|\S#{CC_ALL}*?\S)'(?!#{CG_WORD})/m]
+  compat_quote_subs[3] = [:single, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+)\])?`(\S|\S#{CC_ALL}*?\S)'(?!#{CG_WORD})/m]
   # ++monospaced++
-  compat_quote_subs[4] = [:monospaced, :unconstrained, /\\?(?:\[([^\]]+?)\])?\+\+(#{CC_ALL}+?)\+\+/m]
+  compat_quote_subs[4] = [:monospaced, :unconstrained, /\\?(?:\[([^\]]+)\])?\+\+(#{CC_ALL}+?)\+\+/m]
   # +monospaced+
-  compat_quote_subs[5] = [:monospaced, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+?)\])?\+(\S|\S#{CC_ALL}*?\S)\+(?!#{CG_WORD})/m]
+  compat_quote_subs[5] = [:monospaced, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+)\])?\+(\S|\S#{CC_ALL}*?\S)\+(?!#{CG_WORD})/m]
   # #unquoted#
   #compat_quote_subs[8] = [:unquoted, *compat_quote_subs[8][1..-1]]
   # ##unquoted##
   #compat_quote_subs[9] = [:unquoted, *compat_quote_subs[9][1..-1]]
   # 'emphasis'
-  compat_quote_subs.insert 3, [:emphasis, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+?)\])?'(\S|\S#{CC_ALL}*?\S)'(?!#{CG_WORD})/m]
+  compat_quote_subs.insert 3, [:emphasis, :constrained, /(^|[^#{CC_WORD};:}])(?:\[([^\]]+)\])?'(\S|\S#{CC_ALL}*?\S)'(?!#{CG_WORD})/m]
 
   QUOTE_SUBS = {
     false => quote_subs,
@@ -1244,7 +1265,7 @@ module Asciidoctor
     # left double arrow <=
     [/\\?&lt;=/, '&#8656;', :none],
     # restore entities
-    [/\\?(&)amp;((?:[a-zA-Z]+|#\d{2,5}|#x[a-fA-F0-9]{2,4});)/, '', :bounding]
+    [/\\?(&)amp;((?:[a-zA-Z][a-zA-Z]+\d{0,2}|#\d\d\d{0,4}|#x[\da-fA-F][\da-fA-F][\da-fA-F]{0,3});)/, '', :bounding]
   ]
 
   class << self
@@ -1252,8 +1273,9 @@ module Asciidoctor
   # Public: Parse the AsciiDoc source input into a {Document}
   #
   # Accepts input as an IO (or StringIO), String or String Array object. If the
-  # input is a File, information about the file is stored in attributes on the
-  # Document object.
+  # input is a File, the object is expected to be opened for reading and is not
+  # closed afterwards by this method. Information about the file (filename,
+  # directory name, etc) gets assigned to attributes on the Document object.
   #
   # input   - the AsciiDoc source as a IO, String or Array.
   # options - a String, Array or Hash of options to control processing (default: {})
@@ -1263,56 +1285,63 @@ module Asciidoctor
   # Returns the Document
   def load input, options = {}
     options = options.dup
+
     if (timings = options[:timings])
       timings.start :read
     end
 
-    attributes = options[:attributes] = if !(attrs = options[:attributes])
-      {}
-    elsif (attrs.is_a? ::Hash) || (::RUBY_ENGINE_JRUBY && (attrs.is_a? ::Java::JavaUtil::Map))
-      attrs.dup
-    elsif attrs.is_a? ::Array
-      attrs.inject({}) do |accum, entry|
-        k, v = entry.split '=', 2
-        accum[k] = v || ''
-        accum
-      end
-    elsif attrs.is_a? ::String
-      # convert non-escaped spaces into null character, so we split on the
-      # correct spaces chars, and restore escaped spaces
-      capture_1 = ::RUBY_ENGINE_OPAL ? '$1' : '\1'
-      attrs = attrs.gsub(SpaceDelimiterRx, %(#{capture_1}#{NULL})).gsub(EscapedSpaceRx, capture_1)
+    if (logger = options[:logger]) && logger != LoggerManager.logger
+      LoggerManager.logger = logger
+    end
 
-      attrs.split(NULL).inject({}) do |accum, entry|
+    if !(attrs = options[:attributes])
+      attrs = {}
+    elsif ::Hash === attrs || (::RUBY_ENGINE_JRUBY && ::Java::JavaUtil::Map === attrs)
+      attrs = attrs.dup
+    elsif ::Array === attrs
+      attrs, attrs_arr = {}, attrs
+      attrs_arr.each do |entry|
         k, v = entry.split '=', 2
-        accum[k] = v || ''
-        accum
+        attrs[k] = v || ''
+      end
+    elsif ::String === attrs
+      # condense and convert non-escaped spaces to null, unescape escaped spaces, then split on null
+      attrs, attrs_arr = {}, attrs.gsub(SpaceDelimiterRx, %(\\1#{NULL})).gsub(EscapedSpaceRx, '\1').split(NULL)
+      attrs_arr.each do |entry|
+        k, v = entry.split '=', 2
+        attrs[k] = v || ''
       end
     elsif (attrs.respond_to? :keys) && (attrs.respond_to? :[])
       # convert it to a Hash as we know it
-      original_attrs = attrs
-      attrs = {}
-      original_attrs.keys.each do |key|
-        attrs[key] = original_attrs[key]
-      end
-      attrs
+      attrs = ::Hash[attrs.keys.map {|k| [k, attrs[k]] }]
     else
-      raise ::ArgumentError, %(illegal type for attributes option: #{attrs.class.ancestors})
+      raise ::ArgumentError, %(illegal type for attributes option: #{attrs.class.ancestors.join ' < '})
     end
 
     lines = nil
-    if input.is_a? ::File
+    if ::File === input
+      # TODO cli checks if input path can be read and is file, but might want to add check to API
+      input_path = ::File.expand_path input.path
+      # See https://reproducible-builds.org/specs/source-date-epoch/
+      # NOTE Opal can't call key? on ENV
+      input_mtime = ::ENV['SOURCE_DATE_EPOCH'] ? ::Time.at(Integer ::ENV['SOURCE_DATE_EPOCH']).utc : input.mtime
       lines = input.readlines
-      input_mtime = input.mtime
-      input = ::File.new ::File.expand_path input.path
-      input_path = input.path
       # hold off on setting infile and indir until we get a better sense of their purpose
-      attributes['docfile'] = input_path
-      attributes['docdir'] = ::File.dirname input_path
-      attributes['docname'] = ::File.basename input_path, (::File.extname input_path)
-      attributes['docdate'] = docdate = input_mtime.strftime('%Y-%m-%d')
-      attributes['doctime'] = doctime = input_mtime.strftime('%H:%M:%S %Z')
-      attributes['docdatetime'] = %(#{docdate} #{doctime})
+      attrs['docfile'] = input_path
+      attrs['docdir'] = ::File.dirname input_path
+      attrs['docname'] = Helpers.basename input_path, (attrs['docfilesuffix'] = ::File.extname input_path)
+      if (docdate = attrs['docdate'])
+        attrs['docyear'] ||= ((docdate.index '-') == 4 ? (docdate.slice 0, 4) : nil)
+      else
+        docdate = attrs['docdate'] = (input_mtime.strftime '%F')
+        attrs['docyear'] ||= input_mtime.year.to_s
+      end
+      doctime = (attrs['doctime'] ||= begin
+          input_mtime.strftime '%T %Z'
+        rescue # Asciidoctor.js fails if timezone string has characters outside basic Latin (see asciidoctor.js#23)
+          input_mtime.strftime '%T %z'
+        end)
+      attrs['docdatetime'] = %(#{docdate} #{doctime})
     elsif input.respond_to? :readlines
       # NOTE tty, pipes & sockets can't be rewound, but can't be sniffed easily either
       # just fail the rewind operation silently to handle all cases
@@ -1321,12 +1350,12 @@ module Asciidoctor
       rescue
       end
       lines = input.readlines
-    elsif input.is_a? ::String
-      lines = input.lines.entries
-    elsif input.is_a? ::Array
-      lines = input.dup
+    elsif ::String === input
+      lines = ::RUBY_MIN_VERSION_2 ? input.lines : input.each_line.to_a
+    elsif ::Array === input
+      lines = input.drop 0
     else
-      raise ::ArgumentError, %(Unsupported input type: #{input.class})
+      raise ::ArgumentError, %(unsupported input type: #{input.class})
     end
 
     if timings
@@ -1334,16 +1363,31 @@ module Asciidoctor
       timings.start :parse
     end
 
-    doc = (options[:parse] == false ? (Document.new lines, options) : (Document.new lines,options).parse)
+    options[:attributes] = attrs
+    doc = options[:parse] == false ? (Document.new lines, options) : (Document.new lines, options).parse
+
     timings.record :parse if timings
     doc
+  rescue => ex
+    begin
+      context = %(asciidoctor: FAILED: #{attrs['docfile'] || '<stdin>'}: Failed to load AsciiDoc document)
+      if ex.respond_to? :exception
+        # The original message must be explicitely preserved when wrapping a Ruby exception
+        wrapped_ex = ex.exception %(#{context} - #{ex.message})
+        # JRuby automatically sets backtrace, but not MRI
+        wrapped_ex.set_backtrace ex.backtrace
+      else
+        # Likely a Java exception class
+        wrapped_ex = ex.class.new context, ex
+        wrapped_ex.stack_trace = ex.stack_trace
+      end
+    rescue
+      wrapped_ex = ex
+    end
+    raise wrapped_ex
   end
 
   # Public: Parse the contents of the AsciiDoc source file into an Asciidoctor::Document
-  #
-  # Accepts input as an IO, String or String Array object. If the
-  # input is a File, information about the file is stored in
-  # attributes on the Document.
   #
   # input   - the String AsciiDoc source filename
   # options - a String, Array or Hash of options to control processing (default: {})
@@ -1352,17 +1396,18 @@ module Asciidoctor
   #
   # Returns the Asciidoctor::Document
   def load_file filename, options = {}
-    self.load ::File.new(filename || ''), options
+    ::File.open(filename, 'rb') {|file| self.load file, options }
   end
 
   # Public: Parse the AsciiDoc source input into an Asciidoctor::Document and
   # convert it to the specified backend format.
   #
-  # Accepts input as an IO, String or String Array object. If the
-  # input is a File, information about the file is stored in
-  # attributes on the Document.
+  # Accepts input as an IO (or StringIO), String or String Array object. If the
+  # input is a File, the object is expected to be opened for reading and is not
+  # closed afterwards by this method. Information about the file (filename,
+  # directory name, etc) gets assigned to attributes on the Document object.
   #
-  # If the :in_place option is true, and the input is a File, the output is
+  # If the :to_file option is true, and the input is a File, the output is
   # written to a file adjacent to the input file, having an extension that
   # corresponds to the backend format. Otherwise, if the :to_file option is
   # specified, the file is written to that file. If :to_file is not an absolute
@@ -1386,14 +1431,14 @@ module Asciidoctor
   # file, otherwise the converted String
   def convert input, options = {}
     options = options.dup
+    options.delete(:parse)
     to_file = options.delete(:to_file)
     to_dir = options.delete(:to_dir)
     mkdirs = options.delete(:mkdirs) || false
-    timings = options[:timings]
 
     case to_file
     when true, nil
-      write_to_same_dir = !to_dir && (input.is_a? ::File)
+      write_to_same_dir = !to_dir && ::File === input
       stream_output = false
       write_to_target = to_dir
       to_file = nil
@@ -1402,29 +1447,44 @@ module Asciidoctor
       stream_output = false
       write_to_target = false
       to_file = nil
+    when '/dev/null'
+      return self.load input, options
     else
       write_to_same_dir = false
-      stream_output = to_file.respond_to? :write
-      write_to_target = stream_output ? false : to_file
+      write_to_target = (stream_output = to_file.respond_to? :write) ? false : (options[:to_file] = to_file)
     end
 
-    if !options.key?(:header_footer) && (write_to_same_dir || write_to_target)
-      options[:header_footer] = true
+    unless options.key? :header_footer
+      options[:header_footer] = true if write_to_same_dir || write_to_target
     end
 
+    # NOTE outfile may be controlled by document attributes, so resolve outfile after loading
+    if write_to_same_dir
+      input_path = ::File.expand_path input.path
+      options[:to_dir] = (outdir = ::File.dirname input_path)
+    elsif write_to_target
+      if to_dir
+        if to_file
+          options[:to_dir] = ::File.dirname ::File.expand_path ::File.join to_dir, to_file
+        else
+          options[:to_dir] = ::File.expand_path to_dir
+        end
+      elsif to_file
+        options[:to_dir] = ::File.dirname ::File.expand_path to_file
+      end
+    end
+
+    # NOTE :to_dir is always set when outputting to a file
+    # NOTE :to_file option only passed if assigned an explicit path
     doc = self.load input, options
 
-    if to_file == '/dev/null'
-      return doc
-    elsif write_to_same_dir
-      infile = ::File.expand_path input.path
-      outfile = ::File.join ::File.dirname(infile), %(#{doc.attributes['docname']}#{doc.attributes['outfilesuffix']})
-      if outfile == infile
-        raise ::IOError, 'Input file and output file are the same!'
+    if write_to_same_dir # write to file in same directory
+      outfile = ::File.join outdir, %(#{doc.attributes['docname']}#{doc.outfilesuffix})
+      if outfile == input_path
+        raise ::IOError, %(input file and output file cannot be the same: #{outfile})
       end
-      outdir = ::File.dirname outfile
-    elsif write_to_target
-      working_dir = options.has_key?(:base_dir) ? ::File.expand_path(options[:base_dir]) : ::File.expand_path(::Dir.pwd)
+    elsif write_to_target # write to explicit file or directory
+      working_dir = (options.key? :base_dir) ? (::File.expand_path options[:base_dir]) : ::Dir.pwd
       # QUESTION should the jail be the working_dir or doc.base_dir???
       jail = doc.safe >= SafeMode::SAFE ? working_dir : nil
       if to_dir
@@ -1434,7 +1494,7 @@ module Asciidoctor
           # reestablish outdir as the final target directory (in the case to_file had directory segments)
           outdir = ::File.dirname outfile
         else
-          outfile = ::File.join outdir, %(#{doc.attributes['docname']}#{doc.attributes['outfilesuffix']})
+          outfile = ::File.join outdir, %(#{doc.attributes['docname']}#{doc.outfilesuffix})
         end
       elsif to_file
         outfile = doc.normalize_system_path(to_file, working_dir, jail, :target_name => 'to_dir', :recover => false)
@@ -1442,44 +1502,50 @@ module Asciidoctor
         outdir = ::File.dirname outfile
       end
 
-      unless ::File.directory? outdir
-        if mkdirs
-          ::FileUtils.mkdir_p outdir
-        else
-          # NOTE we intentionally refer to the directory as it was passed to the API
-          raise ::IOError, %(target directory does not exist: #{to_dir})
-        end
+      if ::File === input && outfile == (::File.expand_path input.path)
+        raise ::IOError, %(input file and output file cannot be the same: #{outfile})
       end
-    else
+
+      if mkdirs
+        Helpers.mkdir_p outdir
+      else
+        # NOTE we intentionally refer to the directory as it was passed to the API
+        raise ::IOError, %(target directory does not exist: #{to_dir} (hint: set mkdirs option)) unless ::File.directory? outdir
+      end
+    else # write to stream
       outfile = to_file
       outdir = nil
     end
 
-    timings.start :convert if timings
-    output = doc.convert
-    timings.record :convert if timings
+    opts = outfile && !stream_output ? { 'outfile' => outfile, 'outdir' => outdir } : {}
+    output = doc.convert opts
 
     if outfile
-      timings.start :write if timings
-      unless stream_output
-        doc.attributes['outfile'] = outfile
-        doc.attributes['outdir'] = outdir
-      end
       doc.write output, outfile
-      timings.record :write if timings
 
       # NOTE document cannot control this behavior if safe >= SafeMode::SERVER
-      if !stream_output && doc.safe < SafeMode::SECURE && (doc.attr? 'basebackend-html') &&
-          (doc.attr? 'linkcss') && (doc.attr? 'copycss')
-        copy_asciidoctor_stylesheet = DEFAULT_STYLESHEET_KEYS.include?(stylesheet = (doc.attr 'stylesheet'))
-        copy_user_stylesheet = !copy_asciidoctor_stylesheet && !stylesheet.nil_or_empty?
+      # NOTE skip if stylesdir is a URI
+      if !stream_output && doc.safe < SafeMode::SECURE && (doc.attr? 'linkcss') &&
+          (doc.attr? 'copycss') && (doc.attr? 'basebackend-html') &&
+          !((stylesdir = (doc.attr 'stylesdir')) && (Helpers.uriish? stylesdir))
+        copy_asciidoctor_stylesheet = false
+        copy_user_stylesheet = false
+        if (stylesheet = (doc.attr 'stylesheet'))
+          if DEFAULT_STYLESHEET_KEYS.include? stylesheet
+            copy_asciidoctor_stylesheet = true
+          elsif !(Helpers.uriish? stylesheet)
+            copy_user_stylesheet = true
+          end
+        end
         copy_coderay_stylesheet = (doc.attr? 'source-highlighter', 'coderay') && (doc.attr 'coderay-css', 'class') == 'class'
         copy_pygments_stylesheet = (doc.attr? 'source-highlighter', 'pygments') && (doc.attr 'pygments-css', 'class') == 'class'
         if copy_asciidoctor_stylesheet || copy_user_stylesheet || copy_coderay_stylesheet || copy_pygments_stylesheet
-          outdir = doc.attr('outdir')
-          stylesoutdir = doc.normalize_system_path(doc.attr('stylesdir'), outdir,
-              doc.safe >= SafeMode::SAFE ? outdir : nil)
-          Helpers.mkdir_p stylesoutdir if mkdirs
+          stylesoutdir = doc.normalize_system_path(stylesdir, outdir, doc.safe >= SafeMode::SAFE ? outdir : nil)
+          if mkdirs
+            Helpers.mkdir_p stylesoutdir
+          else
+            raise ::IOError, %(target stylesheet directory does not exist: #{stylesoutdir} (hint: set mkdirs option)) unless ::File.directory? stylesoutdir
+          end
 
           if copy_asciidoctor_stylesheet
             Stylesheets.instance.write_primary_stylesheet stylesoutdir
@@ -1488,13 +1554,14 @@ module Asciidoctor
             if (stylesheet_src = (doc.attr 'copycss')).empty?
               stylesheet_src = doc.normalize_system_path stylesheet
             else
+              # NOTE in this case, copycss is a source location (but cannot be a URI)
               stylesheet_src = doc.normalize_system_path stylesheet_src
             end
-            stylesheet_dst = doc.normalize_system_path stylesheet, stylesoutdir, (doc.safe >= SafeMode::SAFE ? outdir : nil)
-            unless stylesheet_src == stylesheet_dst || (stylesheet_content = doc.read_asset stylesheet_src).nil?
-              ::File.open(stylesheet_dst, 'w') {|f|
-                f.write stylesheet_content
-              }
+            stylesheet_dest = doc.normalize_system_path stylesheet, stylesoutdir, (doc.safe >= SafeMode::SAFE ? outdir : nil)
+            # NOTE don't warn if src can't be read and dest already exists (see #2323)
+            if stylesheet_src != stylesheet_dest && (stylesheet_data = doc.read_asset stylesheet_src,
+                :warn_on_failure => !(::File.file? stylesheet_dest), :label => 'stylesheet')
+              ::IO.write stylesheet_dest, stylesheet_data
             end
           end
 
@@ -1512,7 +1579,7 @@ module Asciidoctor
   end
 
   # Alias render to convert to maintain backwards compatibility
-  alias :render :convert
+  alias render convert
 
   # Public: Parse the contents of the AsciiDoc source file into an
   # Asciidoctor::Document and convert it to the specified backend format.
@@ -1525,22 +1592,39 @@ module Asciidoctor
   # Returns the Document object if the converted String is written to a
   # file, otherwise the converted String
   def convert_file filename, options = {}
-    self.convert ::File.new(filename || ''), options
+    ::File.open(filename, 'rb') {|file| self.convert file, options }
   end
 
   # Alias render_file to convert_file to maintain backwards compatibility
-  alias :render_file :convert_file
+  alias render_file convert_file
+
+  # Internal: Automatically load the Asciidoctor::Extensions module.
+  #
+  # Requires the Asciidoctor::Extensions module if the name is :Extensions.
+  # Otherwise, delegates to the super method.
+  #
+  # This method provides the same functionality as using autoload on
+  # Asciidoctor::Extensions, except that the constant isn't recognized as
+  # defined prior to it being loaded.
+  #
+  # Returns the resolved constant, if resolved, otherwise nothing.
+  def const_missing name
+    if name == :Extensions
+      require 'asciidoctor/extensions'
+      Extensions
+    else
+      super
+    end
+  end unless RUBY_ENGINE == 'opal'
 
   end
 
   if RUBY_ENGINE == 'opal'
-    require 'asciidoctor/debug'
-    require 'asciidoctor/version'
     require 'asciidoctor/timings'
+    require 'asciidoctor/version'
   else
-    autoload :Debug,   'asciidoctor/debug'
-    autoload :VERSION, 'asciidoctor/version'
     autoload :Timings, 'asciidoctor/timings'
+    autoload :VERSION, 'asciidoctor/version'
   end
 end
 
@@ -1560,7 +1644,6 @@ require 'asciidoctor/attribute_list'
 require 'asciidoctor/block'
 require 'asciidoctor/callouts'
 require 'asciidoctor/converter'
-require 'asciidoctor/converter/html5' if RUBY_ENGINE_OPAL
 require 'asciidoctor/document'
 require 'asciidoctor/inline'
 require 'asciidoctor/list'
@@ -1570,3 +1653,6 @@ require 'asciidoctor/reader'
 require 'asciidoctor/section'
 require 'asciidoctor/stylesheets'
 require 'asciidoctor/table'
+
+# this require is satisfied by the Asciidoctor.js build; it supplies compile and runtime overrides for Asciidoctor.js
+require 'asciidoctor/js/postscript' if RUBY_ENGINE == 'opal'

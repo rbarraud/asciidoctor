@@ -1,3 +1,4 @@
+# encoding: UTF-8
 module Asciidoctor
   # A base module for defining converters that can be used to convert {AbstractNode}
   # objects in a parsed AsciiDoc document to a backend format such as HTML or
@@ -19,12 +20,12 @@ module Asciidoctor
   #       super
   #       outfilesuffix '.txt'
   #     end
-  #     def convert node, transform = nil
+  #     def convert node, transform = nil, opts = {}
   #       case (transform ||= node.node_name)
   #       when 'document'
   #         node.content
   #       when 'section'
-  #         [node.title, node.content] * "\n\n"
+  #         [node.title, node.content].join "\n\n"
   #       when 'paragraph'
   #         node.content.tr("\n", ' ') << "\n"
   #       else
@@ -85,43 +86,51 @@ module Asciidoctor
           syntax = 'html'
         end
         {
-          'basebackend' => base,
-          'outfilesuffix' => ext,
-          'filetype' => type,
-          'htmlsyntax' => syntax
+          :basebackend => base,
+          :outfilesuffix => ext,
+          :filetype => type,
+          :htmlsyntax => syntax
         }
       end
 
       def filetype value = nil
         if value
-          backend_info['filetype'] = value
+          backend_info[:filetype] = value
         else
-          backend_info['filetype']
+          backend_info[:filetype]
         end
       end
 
       def basebackend value = nil
         if value
-          backend_info['basebackend'] = value
+          backend_info[:basebackend] = value
         else
-          backend_info['basebackend']
+          backend_info[:basebackend]
         end
       end
 
       def outfilesuffix value = nil
         if value
-          backend_info['outfilesuffix'] = value
+          backend_info[:outfilesuffix] = value
         else
-          backend_info['outfilesuffix']
+          backend_info[:outfilesuffix]
         end
       end
 
       def htmlsyntax value = nil
         if value
-          backend_info['htmlsyntax'] = value
+          backend_info[:htmlsyntax] = value
         else
-          backend_info['htmlsyntax']
+          backend_info[:htmlsyntax]
         end
+      end
+
+      def supports_templates
+        backend_info[:supports_templates] = true
+      end
+
+      def supports_templates?
+        backend_info[:supports_templates]
       end
     end
 
@@ -135,7 +144,7 @@ module Asciidoctor
         converter.extend Config
       end
     end
-  
+
     include Config
     include BackendInfo
 
@@ -160,9 +169,9 @@ module Asciidoctor
     end
 =end
 
-    # Public: Converts an {AbstractNode} using the specified transform. If a
-    # transform is not specified, implementations typically derive one from the
-    # {AbstractNode#node_name} property.
+    # Public: Converts an {AbstractNode} using the specified transform along
+    # with additional options. If a transform is not specified, implementations
+    # typically derive one from the {AbstractNode#node_name} property.
     #
     # Implementations are free to decide how to carry out the conversion. In
     # the case of the built-in converters, the tranform value is used to
@@ -174,27 +183,18 @@ module Asciidoctor
     #             should be applied to this node. If a transform is not specified,
     #             the transform is typically derived from the value of the
     #             node's node_name property. (optional, default: nil)
+    # opts      - An optional Hash of options that provide additional hints about
+    #             how to convert the node. (optional, default: {})
     #
     # Returns the [String] result
-    def convert node, transform = nil
+    def convert node, transform = nil, opts = {}
       raise ::NotImplementedError
     end
 
-    # Public: Converts an {AbstractNode} using the specified transform along
-    # with additional options. Delegates to {#convert} without options by default.
-    #
-    # node      - The concrete instance of AbstractNode to convert
-    # transform - An optional String transform that hints at which transformation
-    #             should be applied to this node. If a transform is not specified,
-    #             the transform is typically derived from the value of the
-    #             node's node_name property. (optional, default: nil)
-    # opts      - An optional Hash of options that provide additional hints about
-    #             how to convert the node.
-    #
-    # Returns the [String] result
-    def convert_with_options node, transform = nil, opts = {}
-      convert node, transform
-    end
+    alias handles? respond_to?
+
+    # Alias for backward compatibility.
+    alias convert_with_options convert
   end
 
   # A module that can be used to mix the {#write} method into a {Converter}
@@ -212,9 +212,9 @@ module Asciidoctor
       if target.respond_to? :write
         target.write output.chomp
         # ensure there's a trailing endline to be nice to terminals
-        target.write EOL
+        target.write LF
       else
-        ::File.open(target, 'w') {|f| f.write output }
+        ::IO.write target, output
       end
       nil
     end

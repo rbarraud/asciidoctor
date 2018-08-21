@@ -1,3 +1,4 @@
+# encoding: UTF-8
 module Asciidoctor
 # A utility class for working with the built-in stylesheets.
 #--
@@ -5,9 +6,9 @@ module Asciidoctor
 # QUESTION create method for user stylesheet?
 class Stylesheets
   DEFAULT_STYLESHEET_NAME = 'asciidoctor.css'
-  #DEFAULT_CODERAY_STYLE = 'asciidoctor'
   DEFAULT_PYGMENTS_STYLE = 'default'
   STYLESHEETS_DATA_PATH = ::File.join DATA_PATH, 'stylesheets'
+  PygmentsBgColorRx = /^\.pygments +\{ *background: *([^;]+);/
 
   @__instance__ = new
 
@@ -23,7 +24,7 @@ class Stylesheets
   #
   # returns the [String] Asciidoctor stylesheet data
   def primary_stylesheet_data
-    @primary_stylesheet_data ||= ::IO.read(::File.join(STYLESHEETS_DATA_PATH, 'asciidoctor-default.css')).chomp
+    @primary_stylesheet_data ||= ::IO.read(::File.join(STYLESHEETS_DATA_PATH, 'asciidoctor-default.css')).rstrip
   end
 
   def embed_primary_stylesheet
@@ -32,8 +33,8 @@ class Stylesheets
 </style>)
   end
 
-  def write_primary_stylesheet target_dir
-    ::File.open(::File.join(target_dir, primary_stylesheet_name), 'w') {|f| f.write primary_stylesheet_data }
+  def write_primary_stylesheet target_dir = '.'
+    ::IO.write(::File.join(target_dir, primary_stylesheet_name), primary_stylesheet_data)
   end
 
   def coderay_stylesheet_name
@@ -44,10 +45,11 @@ class Stylesheets
   #
   # returns the [String] CodeRay stylesheet data
   def coderay_stylesheet_data
-    # NOTE use the following two lines to load a built-in theme instead
-    # Helpers.require_library 'coderay'
-    # ::CodeRay::Encoders[:html]::CSS.new(:default).stylesheet
-    @coderay_stylesheet_data ||= ::IO.read(::File.join(STYLESHEETS_DATA_PATH, 'coderay-asciidoctor.css')).chomp
+    # NOTE use the following lines to load a built-in theme instead
+    # unless load_coderay.nil?
+    #   ::CodeRay::Encoders[:html]::CSS.new(:default).stylesheet
+    # end
+    @coderay_stylesheet_data ||= ::IO.read(::File.join(STYLESHEETS_DATA_PATH, 'coderay-asciidoctor.css')).rstrip
   end
 
   def embed_coderay_stylesheet
@@ -56,21 +58,32 @@ class Stylesheets
 </style>)
   end
 
-  def write_coderay_stylesheet target_dir
-    ::File.open(::File.join(target_dir, coderay_stylesheet_name), 'w') {|f| f.write coderay_stylesheet_data }
+  def write_coderay_stylesheet target_dir = '.'
+    ::IO.write(::File.join(target_dir, coderay_stylesheet_name), coderay_stylesheet_data)
   end
 
   def pygments_stylesheet_name style = nil
-    style ||= DEFAULT_PYGMENTS_STYLE
-    %(pygments-#{style}.css)
+    %(pygments-#{style || DEFAULT_PYGMENTS_STYLE}.css)
+  end
+
+  def pygments_background style = nil
+    if load_pygments && PygmentsBgColorRx =~ (::Pygments.css '.pygments', :style => style || DEFAULT_PYGMENTS_STYLE)
+      $1
+    end
   end
 
   # Public: Generate the Pygments stylesheet with the specified style.
   #
   # returns the [String] Pygments stylesheet data
   def pygments_stylesheet_data style = nil
-    style ||= DEFAULT_PYGMENTS_STYLE
-    (@pygments_stylesheet_data ||= load_pygments)[style] ||= ::Pygments.css '.listingblock pre.highlight', :classprefix => 'tok-', :style => style
+    if load_pygments
+      style ||= DEFAULT_PYGMENTS_STYLE
+      (@pygments_stylesheet_data ||= {})[style] ||=
+          ((::Pygments.css '.listingblock .pygments', :classprefix => 'tok-', :style => style) || '/* Failed to load Pygments CSS. */').
+          sub('.listingblock .pygments  {', '.listingblock .pygments, .listingblock .pygments code {')
+    else
+      '/* Pygments CSS disabled. Pygments is not available. */'
+    end
   end
 
   def embed_pygments_stylesheet style = nil
@@ -79,13 +92,16 @@ class Stylesheets
 </style>)
   end
 
-  def write_pygments_stylesheet target_dir, style = nil
-    ::File.open(::File.join(target_dir, pygments_stylesheet_name(style)), 'w') {|f| f.write pygments_stylesheet_data(style) }
+  def write_pygments_stylesheet target_dir = '.', style = nil
+    ::IO.write(::File.join(target_dir, pygments_stylesheet_name(style)), pygments_stylesheet_data(style))
   end
 
+  #def load_coderay
+  #  (defined? ::CodeRay) ? true : !(Helpers.require_library 'coderay', true, :ignore).nil?
+  #end
+
   def load_pygments
-    Helpers.require_library 'pygments', 'pygments.rb' unless defined? ::Pygments
-    {}
+    (defined? ::Pygments) ? true : !(Helpers.require_library 'pygments', 'pygments.rb', :ignore).nil?
   end
 end
 end

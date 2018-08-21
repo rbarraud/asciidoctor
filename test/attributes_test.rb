@@ -5,6 +5,16 @@ unless defined? ASCIIDOCTOR_PROJECT_DIR
 end
 
 context 'Attributes' do
+  default_logger = Asciidoctor::LoggerManager.logger
+
+  setup do
+    Asciidoctor::LoggerManager.logger = (@logger = Asciidoctor::MemoryLogger.new)
+  end
+
+  teardown do
+    Asciidoctor::LoggerManager.logger = default_logger
+  end
+
   context 'Assignment' do
     test 'creates an attribute' do
       doc = document_from_string(':frog: Tanglefoot')
@@ -13,8 +23,44 @@ context 'Attributes' do
 
     test 'requires a space after colon following attribute name' do
       doc = document_from_string 'foo:bar'
-      assert_equal nil, doc.attributes['foo']
+      assert_nil doc.attributes['foo']
     end
+
+    # NOTE AsciiDoc Python recognizes this entry
+    test 'does not recognize attribute entry if name contains colon' do
+      input = <<-EOS.chomp
+:foo:bar: baz
+      EOS
+      doc = document_from_string input
+      refute doc.attr?('foo:bar')
+      assert_equal 1, doc.blocks.size
+      assert_equal :paragraph, doc.blocks[0].context
+    end
+
+    # NOTE AsciiDoc Python recognizes this entry
+    test 'does not recognize attribute entry if name ends with colon' do
+      input = <<-EOS.chomp
+:foo:: bar
+      EOS
+      doc = document_from_string input
+      refute doc.attr?('foo:')
+      assert_equal 1, doc.blocks.size
+      assert_equal :dlist, doc.blocks[0].context
+    end
+
+    # NOTE AsciiDoc Python does not recognize this entry
+    test 'allows any word character defined by Unicode in an attribute name' do
+      [['café', 'a coffee shop'], ['سمن', %(سازمان مردمنهاد)]].each do |(name, value)|
+        str = <<-EOS
+:#{name}: #{value}
+
+{#{name}}
+        EOS
+        result = render_embedded_string str
+        assert_includes result, %(<p>#{value}</p>)
+      end
+
+    end if ::RUBY_MIN_VERSION_1_9
 
     test 'creates an attribute by fusing a legacy multi-line value' do
       str = <<-EOS
@@ -46,34 +92,44 @@ linus.torvalds@example.com
       assert_equal %(Linus Torvalds +\nLinux Hacker +\nlinus.torvalds@example.com), doc.attributes['signature']
     end
 
+    test 'should allow pass macro to surround a multi-line value that contains line breaks' do
+      str = <<-EOS
+:signature: pass:a[{author} + \\
+{title} + \\
+{email}]
+      EOS
+      doc = document_from_string str, :attributes => { 'author' => 'Linus Torvalds', 'title' => 'Linux Hacker', 'email' => 'linus.torvalds@example.com' }
+      assert_equal %(Linus Torvalds +\nLinux Hacker +\nlinus.torvalds@example.com), (doc.attr 'signature')
+    end
+
     test 'should delete an attribute that ends with !' do
       doc = document_from_string(":frog: Tanglefoot\n:frog!:")
-      assert_equal nil, doc.attributes['frog']
+      assert_nil doc.attributes['frog']
     end
 
     test 'should delete an attribute that ends with ! set via API' do
       doc = document_from_string(":frog: Tanglefoot", :attributes => {'frog!' => ''})
-      assert_equal nil, doc.attributes['frog']
+      assert_nil doc.attributes['frog']
     end
 
     test 'should delete an attribute that begins with !' do
       doc = document_from_string(":frog: Tanglefoot\n:!frog:")
-      assert_equal nil, doc.attributes['frog']
+      assert_nil doc.attributes['frog']
     end
 
     test 'should delete an attribute that begins with ! set via API' do
       doc = document_from_string(":frog: Tanglefoot", :attributes => {'!frog' => ''})
-      assert_equal nil, doc.attributes['frog']
+      assert_nil doc.attributes['frog']
     end
 
     test 'should delete an attribute set via API to nil value' do
       doc = document_from_string(":frog: Tanglefoot", :attributes => {'frog' => nil})
-      assert_equal nil, doc.attributes['frog']
+      assert_nil doc.attributes['frog']
     end
 
     test "doesn't choke when deleting a non-existing attribute" do
       doc = document_from_string(':frog!:')
-      assert_equal nil, doc.attributes['frog']
+      assert_nil doc.attributes['frog']
     end
 
     test "replaces special characters in attribute value" do
@@ -86,14 +142,100 @@ linus.torvalds@example.com
       assert_equal 'Asciidoctor 1.0', doc.attributes['release']
     end
 
-    test "assigns attribute to empty string if substitution fails to resolve attribute" do
-      doc = document_from_string ":release: Asciidoctor {version}", :attributes => { 'attribute-missing' => 'drop-line' }
-      assert_equal '', doc.attributes['release']
+    test 'assigns attribute to empty string if substitution fails to resolve attribute' do
+      input = ':release: Asciidoctor {version}'
+      document_from_string input, :attributes => { 'attribute-missing' => 'drop-line' }
+      assert_message @logger, :WARN, 'dropping line containing reference to missing attribute: version'
     end
 
-    test "assigns multi-line attribute to empty string if substitution fails to resolve attribute" do
-      doc = document_from_string ":release: Asciidoctor +\n          {version}", :attributes => { 'attribute-missing' => 'drop-line' }
+    test 'assigns multi-line attribute to empty string if substitution fails to resolve attribute' do
+      input = <<-EOS
+:release: Asciidoctor +
+          {version}
+      EOS
+      doc = document_from_string input, :attributes => { 'attribute-missing' => 'drop-line' }
       assert_equal '', doc.attributes['release']
+      assert_message @logger, :WARN, 'dropping line containing reference to missing attribute: version'
+    end
+
+    test 'resolves attributes inside attribute value within header' do
+      input = <<-EOS
+= Document Title
+:big: big
+:bigfoot: {big}foot
+
+{bigfoot}
+      EOS
+
+      result = render_embedded_string input
+      assert_includes result, 'bigfoot'
+    end
+
+    test 'resolves attributes and pass macro inside attribute value outside header' do
+      input = <<-EOS
+= Document Title
+
+content
+
+:big: pass:a,q[_big_]
+:bigfoot: {big}foot
+{bigfoot}
+      EOS
+
+      result = render_embedded_string input
+      assert_includes result, '<em>big</em>foot'
+    end
+
+    test 'should limit maximum size of attribute value if safe mode is SECURE' do
+      expected = 'a' * 4096
+      input = <<-EOS
+:name: #{'a' * 5000}
+
+{name}
+      EOS
+
+      result = render_embedded_string input, :doctype => :inline
+      assert_equal expected, result
+      assert_equal 4096, result.bytesize
+    end
+
+    test 'should handle multibyte characters when limiting attribute value size' do
+      expected = '日本'
+      input = <<-EOS
+:name: 日本語
+
+{name}
+      EOS
+
+      result = render_embedded_string input, :doctype => :inline, :attributes => { 'max-attribute-value-size' => 6 }
+      assert_equal expected, result
+      assert_equal 6, result.bytesize
+    end
+
+    test 'should not mangle multibyte characters when limiting attribute value size' do
+      expected = '日本'
+      input = <<-EOS
+:name: 日本語
+
+{name}
+      EOS
+
+      result = render_embedded_string input, :doctype => :inline, :attributes => { 'max-attribute-value-size' => 8 }
+      assert_equal expected, result
+      assert_equal 6, result.bytesize
+    end
+
+    test 'should allow maximize size of attribute value to be disabled' do
+      expected = 'a' * 5000
+      input = <<-EOS
+:name: #{'a' * 5000}
+
+{name}
+      EOS
+
+      result = render_embedded_string input, :doctype => :inline, :attributes => { 'max-attribute-value-size' => nil }
+      assert_equal expected, result
+      assert_equal 5000, result.bytesize
     end
 
     test 'resolves user-home attribute if safe mode is less than SERVER' do
@@ -133,6 +275,13 @@ EOS
       assert_equal '&lt;&gt;&amp;', doc.attributes['xml-busters']
     end
 
+    test 'should not recognize pass macro with invalid substitution list in attribute value' do
+      [',', '42', 'a,'].each do |subs|
+        doc = document_from_string %(:pass-fail: pass:#{subs}[whale])
+        assert_equal %(pass:#{subs}[whale]), doc.attributes['pass-fail']
+      end
+    end
+
     test "attribute is treated as defined until it's not" do
       input = <<-EOS
 :holygrail:
@@ -151,22 +300,60 @@ endif::holygrail[]
       assert_xpath '(//p)[2][text() = "Buggers! What happened to the grail?"]', output, 1
     end
 
-    # Validates requirement: "Header attributes are overridden by command-line attributes."
-    test 'attribute defined in document options overrides attribute in document' do
+    test 'attribute set via API overrides attribute set in document' do
       doc = document_from_string(':cash: money', :attributes => {'cash' => 'heroes'})
       assert_equal 'heroes', doc.attributes['cash']
     end
 
-    test 'attribute defined in document options cannot be unassigned in document' do
+    test 'attribute set via API cannot be unset by document' do
       doc = document_from_string(':cash!:', :attributes => {'cash' => 'heroes'})
       assert_equal 'heroes', doc.attributes['cash']
     end
 
-    test 'attribute undefined in document options cannot be assigned in document' do
-      doc = document_from_string(':cash: money', :attributes => {'cash!' => '' })
-      assert_equal nil, doc.attributes['cash']
-      doc = document_from_string(':cash: money', :attributes => {'cash' => nil })
-      assert_equal nil, doc.attributes['cash']
+    test 'attribute soft set via API using modifier on name can be overridden by document' do
+      doc = document_from_string(':cash: money', :attributes => {'cash@' => 'heroes'})
+      assert_equal 'money', doc.attributes['cash']
+    end
+
+    test 'attribute soft set via API using modifier on value can be overridden by document' do
+      doc = document_from_string(':cash: money', :attributes => {'cash' => 'heroes@'})
+      assert_equal 'money', doc.attributes['cash']
+    end
+
+    test 'attribute soft set via API using modifier on name can be unset by document' do
+      doc = document_from_string(':cash!:', :attributes => {'cash@' => 'heroes'})
+      assert_nil doc.attributes['cash']
+      doc = document_from_string(':cash!:', :attributes => {'cash@' => true})
+      assert_nil doc.attributes['cash']
+    end
+
+    test 'attribute soft set via API using modifier on value can be unset by document' do
+      doc = document_from_string(':cash!:', :attributes => {'cash' => 'heroes@'})
+      assert_nil doc.attributes['cash']
+    end
+
+    test 'attribute unset via API cannot be set by document' do
+      [
+        { 'cash!' => '' },
+        { '!cash' => '' },
+        { 'cash' => nil },
+      ].each do |attributes|
+        doc = document_from_string(':cash: money', :attributes => attributes)
+        assert_nil doc.attributes['cash']
+      end
+    end
+
+    test 'attribute soft unset via API can be set by document' do
+      [
+        { 'cash!@' => '' },
+        { '!cash@' => '' },
+        { 'cash!' => '@' },
+        { '!cash' => '@' },
+        { 'cash' => false },
+      ].each do |attributes|
+        doc = document_from_string(':cash: money', :attributes => attributes)
+        assert_equal 'money', doc.attributes['cash']
+      end
     end
 
     test 'backend and doctype attributes are set by default in default configuration' do
@@ -254,12 +441,12 @@ content
         assert_equal val, doc.attributes[key]
       end
 
-      assert !doc.attributes.key?('backend-html5')
-      assert !doc.attributes.key?('backend-html5-doctype-article')
-      assert !doc.attributes.key?('basebackend-html')
-      assert !doc.attributes.key?('basebackend-html-doctype-article')
-      assert !doc.attributes.key?('doctype-article')
-      assert !doc.attributes.key?('filetype-html')
+      refute doc.attributes.key?('backend-html5')
+      refute doc.attributes.key?('backend-html5-doctype-article')
+      refute doc.attributes.key?('basebackend-html')
+      refute doc.attributes.key?('basebackend-html-doctype-article')
+      refute doc.attributes.key?('doctype-article')
+      refute doc.attributes.key?('filetype-html')
     end
 
     test 'backend attributes defined in document options overrides backend attribute in document' do
@@ -268,6 +455,26 @@ content
       assert doc.attributes.has_key? 'backend-html5'
       assert_equal 'html', doc.attributes['basebackend']
       assert doc.attributes.has_key? 'basebackend-html'
+    end
+
+    test 'can only access a positional attribute from the attributes hash' do
+      node = Asciidoctor::Block.new nil, :paragraph, :attributes => { 1 => 'position 1' }
+      assert_nil node.attr(1)
+      refute node.attr?(1)
+      assert_equal 'position 1', node.attributes[1]
+    end
+
+    test 'set_attr should set value to empty string if no value is specified' do
+      node = Asciidoctor::Block.new nil, :paragraph, :attributes => {}
+      node.set_attr 'foo'
+      assert_equal '', (node.attr 'foo')
+    end
+
+    test 'remove_attr should remove attribute and return previous value' do
+      doc = empty_document
+      node = Asciidoctor::Block.new doc, :paragraph, :attributes => { 'foo' => 'bar' }
+      assert_equal 'bar', (node.remove_attr 'foo')
+      assert_nil node.attr('foo')
     end
 
     test 'set_attr should not overwrite existing key if overwrite is false' do
@@ -282,6 +489,44 @@ content
       assert_equal 'bar', (node.attr 'foo')
       node.set_attr 'foo', 'baz'
       assert_equal 'baz', (node.attr 'foo')
+    end
+
+    test 'set_attr should set header attribute in loaded document' do
+      input = <<-EOS
+:uri: http://example.org
+
+{uri}
+      EOS
+
+      doc = Asciidoctor.load input, :attributes => { 'uri' => 'https://github.com' }
+      doc.set_attr 'uri', 'https://google.com'
+      output = doc.convert
+      assert_xpath '//a[@href="https://google.com"]', output, 1
+    end
+
+    test 'set_attribute should set attribute if key is not locked' do
+      doc = empty_document
+      refute doc.attr? 'foo'
+      res = doc.set_attribute 'foo', 'baz'
+      assert res
+      assert_equal 'baz', (doc.attr 'foo')
+    end
+
+    test 'set_attribute should not set key if key is locked' do
+      doc = empty_document :attributes => { 'foo' => 'bar' }
+      assert_equal 'bar', (doc.attr 'foo')
+      res = doc.set_attribute 'foo', 'baz'
+      refute res
+      assert_equal 'bar', (doc.attr 'foo')
+    end
+
+    test 'set_attribute should update backend attributes' do
+      doc = empty_document :attributes => { 'backend' => 'html5@' }
+      assert_equal '', (doc.attr 'backend-html5')
+      res = doc.set_attribute 'backend', 'docbook5'
+      assert res
+      refute doc.attr? 'backend-html5'
+      assert_equal '', (doc.attr 'backend-docbook5')
     end
 
     test 'verify toc attribute matrix' do
@@ -306,12 +551,12 @@ toc toc-placement!                        |   |content     |macro        |nil
 
       expected.each do |expect|
         raw_attrs, toc, toc_position, toc_placement, toc_class = expect
-        attrs = Hash[*(raw_attrs.split ' ').map {|e| e.include?('=') ? e.split('=') : [e, ''] }.flatten]
+        attrs = Hash[*raw_attrs.split.map {|e| e.include?('=') ? e.split('=', 2) : [e, ''] }.flatten]
         doc = document_from_string '', :attributes => attrs
-        toc ? (assert doc.attr?('toc', toc)) : (assert !doc.attr?('toc')) 
-        toc_position ? (assert doc.attr?('toc-position', toc_position)) : (assert !doc.attr?('toc-position')) 
-        toc_placement ? (assert doc.attr?('toc-placement', toc_placement)) : (assert !doc.attr?('toc-placement')) 
-        toc_class ? (assert doc.attr?('toc-class', toc_class)) : (assert !doc.attr?('toc-class')) 
+        toc ? (assert doc.attr?('toc', toc)) : (refute doc.attr?('toc'))
+        toc_position ? (assert doc.attr?('toc-position', toc_position)) : (refute doc.attr?('toc-position'))
+        toc_placement ? (assert doc.attr?('toc-placement', toc_placement)) : (refute doc.attr?('toc-placement'))
+        toc_class ? (assert doc.attr?('toc-class', toc_class)) : (refute doc.attr?('toc-class'))
       end
     end
   end
@@ -355,7 +600,7 @@ Yo, {myfrog}!
       assert_xpath '(//p)[1][text()="Yo, Tanglefoot!"]', output, 1
     end
 
-    test "ignores lines with bad attributes if attribute-missing is drop-line" do
+    test 'ignores lines with bad attributes if attribute-missing is drop-line' do
       input = <<-EOS
 :attribute-missing: drop-line
 
@@ -363,15 +608,16 @@ This is
 blah blah {foobarbaz}
 all there is.
       EOS
-      html = render_embedded_string input
-      result = Nokogiri::HTML(html)
-      refute_match(/blah blah/m, result.css("p").first.content.strip)
+      output = render_embedded_string input
+      para = xmlnodes_at_css 'p', output, 1
+      refute_includes 'blah blah', para.content
+      assert_message @logger, :WARN, 'dropping line containing reference to missing attribute: foobarbaz'
     end
 
     test "attribute value gets interpretted when rendering" do
       doc = document_from_string(":google: http://google.com[Google]\n\n{google}")
       assert_equal 'http://google.com[Google]', doc.attributes['google']
-      output = doc.render
+      output = doc.convert
       assert_xpath '//a[@href="http://google.com"][text() = "Google"]', output, 1
     end
 
@@ -386,6 +632,7 @@ Line 2: Oh no, a {bogus-attribute}! This line should not appear in the output.
       output = render_embedded_string input
       assert_match(/Line 1/, output)
       refute_match(/Line 2/, output)
+      assert_message @logger, :WARN, 'dropping line containing reference to missing attribute: bogus-attribute'
     end
 
     test 'should not drop line with reference to missing attribute by default' do
@@ -419,13 +666,35 @@ Line 2: {set:a!}This line should not appear in the output.
 :a:
 
 Line 1: This line should appear in the output.
-Line 2: {set:a!}This line should not appear in the output.
+Line 2: {set:a!}This line should appear in the output.
       EOS
 
       output = render_embedded_string input
       assert_match(/Line 1/, output)
       assert_match(/Line 2/, output)
       refute_match(/\{set:a!\}/, output)
+    end
+
+    test 'should drop line that only contains attribute assignment' do
+      input = <<-EOS
+Line 1
+{set:a}
+Line 2
+      EOS
+
+      output = render_embedded_string input
+      assert_xpath %(//p[text()="Line 1\nLine 2"]), output, 1
+    end
+
+    test 'should drop line that only contains unresolved attribute when attribute-missing is drop' do
+      input = <<-EOS
+Line 1
+{unresolved}
+Line 2
+      EOS
+
+      output = render_embedded_string input, :attributes => { 'attribute-missing' => 'drop' }
+      assert_xpath %(//p[text()="Line 1\nLine 2"]), output, 1
     end
 
     test "substitutes inside unordered list items" do
@@ -499,9 +768,23 @@ v1.0, 2010-01-01: First release!
       assert_equal 'value', doc.attr('a')
       assert_equal 'value', doc.attr('a2')
 
-      output = doc.render
-      assert output.include?('value == value')
-      assert output.include?('2010-01-01 == 2010-01-01')
+      output = doc.convert
+      assert_includes output, 'value == value'
+      assert_includes output, '2010-01-01 == 2010-01-01'
+    end
+
+    test 'should warn if unterminated block comment is detected in document header' do
+      input = <<-EOS
+= Document Title
+:foo: bar
+////
+:hey: there
+
+content
+      EOS
+      doc = document_from_string input
+      assert_nil doc.attr('hey')
+      assert_message @logger, :WARN, '<stdin>: line 3: unterminated comment block', Hash
     end
 
     test 'substitutes inside block title' do
@@ -577,7 +860,7 @@ Belly up to the {foo}.
 
     test 'does not substitute attributes inside listing blocks' do
       input = <<-EOS
-:forecast: snow 
+:forecast: snow
 
 ----
 puts 'The forecast for today is {forecast}'
@@ -588,14 +871,14 @@ puts 'The forecast for today is {forecast}'
     end
 
     test 'does not substitute attributes inside literal blocks' do
-       input = <<-EOS
+      input = <<-EOS
 :foo: bar
 
 ....
 You insert the text {foo} to expand the value
 of the attribute named foo in your document.
 ....
-       EOS
+      EOS
       output = render_string(input)
       assert_match(/\{foo\}/, output)
     end
@@ -627,22 +910,22 @@ of the attribute named foo in your document.
     end
 
     test 'assigns attribute defined in attribute reference with set prefix and value' do
-      input = '{set:foo:bar}{foo}' 
-      output = render_embedded_string input 
+      input = '{set:foo:bar}{foo}'
+      output = render_embedded_string input
       assert_xpath '//p', output, 1
       assert_xpath '//p[text()="bar"]', output, 1
     end
 
     test 'assigns attribute defined in attribute reference with set prefix and no value' do
       input = "{set:foo}\n{foo}yes"
-      output = render_embedded_string input 
+      output = render_embedded_string input
       assert_xpath '//p', output, 1
       assert_xpath '//p[normalize-space(text())="yes"]', output, 1
     end
 
     test 'assigns attribute defined in attribute reference with set prefix and empty value' do
       input = "{set:foo:}\n{foo}yes"
-      output = render_embedded_string input 
+      output = render_embedded_string input
       assert_xpath '//p', output, 1
       assert_xpath '//p[normalize-space(text())="yes"]', output, 1
     end
@@ -687,7 +970,7 @@ of the attribute named foo in your document.
       EOS
 
       doc = document_from_string input
-      output = doc.render
+      output = doc.convert
       assert_equal 1, doc.attributes['mycounter']
       assert_xpath '//p[text()="1"]', output, 1
     end
@@ -698,7 +981,7 @@ of the attribute named foo in your document.
       EOS
 
       doc = document_from_string input
-      output = doc.render
+      output = doc.convert
       assert_equal 1, doc.attributes['mycounter']
       assert_xpath '//p[text()="1"]', output, 0
     end
@@ -709,7 +992,7 @@ of the attribute named foo in your document.
       EOS
 
       doc = document_from_string input
-      doc.render
+      doc.convert
       assert_equal 10, doc.attributes['mycounter']
     end
 
@@ -719,7 +1002,7 @@ of the attribute named foo in your document.
       EOS
 
       doc = document_from_string input
-      doc.render
+      doc.convert
       assert_equal 'A', doc.attributes['mycounter']
     end
 
@@ -733,7 +1016,7 @@ of the attribute named foo in your document.
       EOS
 
       doc = document_from_string input
-      output = doc.render
+      output = doc.convert
       assert_equal 2, doc.attributes['mycounter']
       assert_xpath '//p[text()="2"]', output, 2
     end
@@ -748,11 +1031,11 @@ of the attribute named foo in your document.
       EOS
 
       doc = document_from_string input
-      output = doc.render
+      output = doc.convert
       assert_equal 'A', doc.attributes['mycounter']
       assert_xpath '//p[text()="A"]', output, 2
     end
-    
+
     test 'counter uses 0 as seed value if seed attribute is nil' do
       input = <<-EOS
 :mycounter:
@@ -763,7 +1046,7 @@ of the attribute named foo in your document.
       EOS
 
       doc = document_from_string input
-      output = doc.render :header_footer => false
+      output = doc.convert :header_footer => false
       assert_equal 1, doc.attributes['mycounter']
       assert_xpath '//p[text()="1"]', output, 2
     end
@@ -780,14 +1063,56 @@ after: {counter:mycounter}
       EOS
 
       doc = document_from_string input
-      output = doc.render :header_footer => false
+      output = doc.convert :header_footer => false
       assert_equal 1, doc.attributes['mycounter']
       assert_xpath '//p[text()="before: 1 2 3"]', output, 1
       assert_xpath '//p[text()="after: 1"]', output, 1
     end
+
+    test 'nested document should use counter from parent document' do
+      input = <<-EOS
+.Title for Foo
+image::foo.jpg[]
+
+[cols="2*a"]
+|===
+|
+.Title for Bar
+image::bar.jpg[]
+
+|
+.Title for Baz
+image::baz.jpg[]
+|===
+
+.Title for Qux
+image::qux.jpg[]
+      EOS
+
+      output = render_embedded_string input
+      assert_xpath '//div[@class="title"]', output, 4
+      assert_xpath '//div[@class="title"][text() = "Figure 1. Title for Foo"]', output, 1
+      assert_xpath '//div[@class="title"][text() = "Figure 2. Title for Bar"]', output, 1
+      assert_xpath '//div[@class="title"][text() = "Figure 3. Title for Baz"]', output, 1
+      assert_xpath '//div[@class="title"][text() = "Figure 4. Title for Qux"]', output, 1
+    end
   end
 
   context 'Block attributes' do
+    test 'parses attribute names as name token' do
+      input = <<-EOS
+[normal,foo="bar",_foo="_bar",foo1="bar1",foo-foo="bar-bar",foo.foo="bar.bar"]
+content
+      EOS
+
+      block = block_from_string input
+      assert_equal 'bar', block.attr('foo')
+      assert_equal '_bar', block.attr('_foo')
+      assert_equal 'bar1', block.attr('foo1')
+      assert_equal 'bar-bar', block.attr('foo-foo')
+      assert_equal 'bar.bar', block.attr('foo.foo')
+    end
+
     test 'positional attributes assigned to block' do
       input = <<-EOS
 [quote, author, source]
@@ -845,7 +1170,7 @@ content
       assert_xpath '//*[@class="title"]/strong[text()="title"]', output, 1
     end
 
-    test 'attribute list may begin with space' do
+    test 'attribute list may not begin with space' do
       input = <<-EOS
 [ quote]
 ____
@@ -854,8 +1179,8 @@ ____
       EOS
 
       doc = document_from_string input
-      qb = doc.blocks.first
-      assert_equal 'quote', qb.style
+      b1 = doc.blocks.first
+      assert_equal ['[ quote]'], b1.lines
     end
 
     test 'attribute list may begin with comma' do
@@ -913,7 +1238,7 @@ paragraph
 
       doc = document_from_string input
       para = doc.blocks.first
-      assert !para.attributes.has_key?('id')
+      refute para.attributes.has_key?('id')
     end
 
     test 'role? returns true if role is assigned' do
@@ -937,7 +1262,7 @@ A paragraph
       p = doc.blocks.first
       assert p.role?('lead')
       p2 = doc.blocks.last
-      assert !p2.role?('final')
+      refute p2.role?('final')
     end
 
     test 'has_role? can check for precense of role name' do
@@ -948,7 +1273,7 @@ A paragraph
 
       doc = document_from_string input
       p = doc.blocks.first
-      assert !p.role?('lead')
+      refute p.role?('lead')
       assert p.has_role?('lead')
     end
 
@@ -987,11 +1312,29 @@ A paragraph
 
     test 'id, role and options attributes can be specified on block style using shorthand syntax' do
       input = <<-EOS
-[normal#first.lead%step]
-A normal paragraph.
+[literal#first.lead%step]
+A literal paragraph.
       EOS
       doc = document_from_string(input)
       para = doc.blocks.first
+      assert_equal :literal, para.context
+      assert_equal 'first', para.attributes['id']
+      assert_equal 'lead', para.attributes['role']
+      assert_equal 'step', para.attributes['options']
+      assert para.attributes.has_key?('step-option')
+    end
+
+    test 'id, role and options attributes can be specified using shorthand syntax on block style using multiple block attribute lines' do
+      input = <<-EOS
+[literal]
+[#first]
+[.lead]
+[%step]
+A literal paragraph.
+      EOS
+      doc = document_from_string(input)
+      para = doc.blocks.first
+      assert_equal :literal, para.context
       assert_equal 'first', para.attributes['id']
       assert_equal 'lead', para.attributes['role']
       assert_equal 'step', para.attributes['options']
@@ -1012,6 +1355,151 @@ Text
       assert para.attributes.has_key?('option2-option')
     end
 
+    test 'options specified using shorthand syntax on block style across multiple lines should be additive' do
+      input = <<-EOS
+[%option1]
+[%option2]
+Text
+      EOS
+
+      doc = document_from_string input
+      para = doc.blocks.first
+      assert_equal 'option1,option2', para.attributes['options']
+      assert para.attributes.has_key?('option1-option')
+      assert para.attributes.has_key?('option2-option')
+    end
+
+    test 'roles specified using shorthand syntax on block style across multiple lines should be additive' do
+      input = <<-EOS
+[.role1]
+[.role2.role3]
+Text
+      EOS
+
+      doc = document_from_string input
+      para = doc.blocks.first
+      assert_equal 'role1 role2 role3', para.attributes['role']
+    end
+
+    test 'setting a role using the role attribute replaces any existing roles' do
+      input = <<-EOS
+[.role1]
+[role=role2]
+[.role3]
+Text
+      EOS
+
+      doc = document_from_string input
+      para = doc.blocks.first
+      assert_equal 'role2 role3', para.attributes['role']
+    end
+
+    test 'setting a role using the shorthand syntax on block style should not clear the ID' do
+      input = <<-EOS
+[#id]
+[.role]
+Text
+      EOS
+
+      doc = document_from_string input
+      para = doc.blocks.first
+      assert_equal 'id', para.id
+      assert_equal 'role', para.role
+    end
+
+    test 'a role can be added using add_role when the node has no roles' do
+        input = <<-EOS
+A normal paragraph
+        EOS
+      doc = document_from_string(input)
+      para = doc.blocks.first
+      res = para.add_role 'role1'
+      assert res
+      assert_equal 'role1', para.attributes['role']
+      assert para.has_role? 'role1'
+    end
+
+    test 'a role can be added using add_role when the node already has a role' do
+        input = <<-EOS
+[.role1]
+A normal paragraph
+        EOS
+      doc = document_from_string(input)
+      para = doc.blocks.first
+      res = para.add_role 'role2'
+      assert res
+      assert_equal 'role1 role2', para.attributes['role']
+      assert para.has_role? 'role1'
+      assert para.has_role? 'role2'
+    end
+
+    test 'a role is not added using add_role if the node already has that role' do
+        input = <<-EOS
+[.role1]
+A normal paragraph
+        EOS
+      doc = document_from_string(input)
+      para = doc.blocks.first
+      res = para.add_role 'role1'
+      refute res
+      assert_equal 'role1', para.attributes['role']
+      assert para.has_role? 'role1'
+    end
+
+    test 'an existing role can be removed using remove_role' do
+        input = <<-EOS
+[.role1.role2]
+A normal paragraph
+        EOS
+      doc = document_from_string(input)
+      para = doc.blocks.first
+      res = para.remove_role 'role1'
+      assert res
+      assert_equal 'role2', para.attributes['role']
+      assert para.has_role? 'role2'
+      refute para.has_role?('role1')
+    end
+
+    test 'roles are removed when last role is removed using remove_role' do
+        input = <<-EOS
+[.role1]
+A normal paragraph
+        EOS
+      doc = document_from_string(input)
+      para = doc.blocks.first
+      res = para.remove_role 'role1'
+      assert res
+      refute para.role?
+      assert_nil para.attributes['role']
+      refute para.has_role? 'role1'
+    end
+
+    test 'roles are not changed when a non-existent role is removed using remove_role' do
+        input = <<-EOS
+[.role1]
+A normal paragraph
+        EOS
+      doc = document_from_string(input)
+      para = doc.blocks.first
+      res = para.remove_role 'role2'
+      refute res
+      assert_equal 'role1', para.attributes['role']
+      assert para.has_role? 'role1'
+      refute para.has_role?('role2')
+    end
+
+    test 'roles are not changed when using remove_role if the node has no roles' do
+        input = <<-EOS
+A normal paragraph
+        EOS
+      doc = document_from_string(input)
+      para = doc.blocks.first
+      res = para.remove_role 'role1'
+      refute res
+      assert_nil para.attributes['role']
+      refute para.has_role?('role1')
+    end
+
     test 'option can be specified in first position of block style using shorthand syntax' do
       input = <<-EOS
 [%interactive]
@@ -1022,7 +1510,6 @@ Text
       list = doc.blocks.first
       assert_equal 'interactive', list.attributes['options']
       assert list.attributes.has_key?('interactive-option')
-      assert list.attributes[1] == '%interactive'
     end
 
     test 'id and role attributes can be specified on section style using shorthand syntax' do
@@ -1048,7 +1535,7 @@ content
       section = doc.blocks[0]
       refute_nil section
       assert_equal :section, section.context
-      assert !section.special
+      refute section.special
       output = doc.convert
       assert_css 'section', output, 1
       assert_css 'section#idname', output, 1
@@ -1085,23 +1572,7 @@ paragraph
       assert_equal 'coolio', subsec.id
     end
 
-    test 'block id above document title sets id on document' do
-      input = <<-EOS
-[[reference]]
-Reference Manual
-================
-:css-signature: refguide
-
-preamble
-      EOS
-      doc = document_from_string input
-      assert_equal 'reference', doc.id 
-      assert_equal 'refguide', doc.attr('css-signature')
-      output = doc.render
-      assert_xpath '//body[@id="reference"]', output, 1
-    end
-
-    test "trailing block attributes tranfer to the following section" do
+    test "trailing block attributes transfer to the following section" do
       input = <<-EOS
 [[one]]
 

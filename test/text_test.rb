@@ -6,25 +6,25 @@ end
 
 context "Text" do
   test "proper encoding to handle utf8 characters in document using html backend" do
-    output = example_document(:encoding).render
+    output = example_document(:encoding).convert
     assert_xpath '//p', output, 4
     assert_xpath '//a', output, 1
   end
 
   test "proper encoding to handle utf8 characters in embedded document using html backend" do
-    output = example_document(:encoding, :header_footer => false).render
+    output = example_document(:encoding, :header_footer => false).convert
     assert_xpath '//p', output, 4
     assert_xpath '//a', output, 1
   end
 
   test "proper encoding to handle utf8 characters in document using docbook45 backend" do
-    output = example_document(:encoding, :attributes => {'backend' => 'docbook45', 'xmlns' => ''}).render
+    output = example_document(:encoding, :attributes => {'backend' => 'docbook45', 'xmlns' => ''}).convert
     assert_xpath '//xmlns:simpara', output, 4
     assert_xpath '//xmlns:ulink', output, 1
   end
 
   test "proper encoding to handle utf8 characters in embedded document using docbook45 backend" do
-    output = example_document(:encoding, :header_footer => false, :attributes => {'backend' => 'docbook45'}).render
+    output = example_document(:encoding, :header_footer => false, :attributes => {'backend' => 'docbook45'}).convert
     assert_xpath '//simpara', output, 4
     assert_xpath '//ulink', output, 1
   end
@@ -35,19 +35,19 @@ context "Text" do
     input << "[verse]\n"
     input.concat(File.readlines(sample_doc_path(:encoding)))
     doc = empty_document
-    reader = Asciidoctor::PreprocessorReader.new doc, input
+    reader = Asciidoctor::PreprocessorReader.new doc, input, nil, :normalize => true
     block = Asciidoctor::Parser.next_block(reader, doc)
-    assert_xpath '//pre', block.render.gsub(/^\s*\n/, ''), 1
+    assert_xpath '//pre', block.convert.gsub(/^\s*\n/, ''), 1
   end
 
   test 'proper encoding to handle utf8 characters from included file' do
     input = <<-EOS
 include::fixtures/encoding.asciidoc[tags=romé]
     EOS
-    doc = empty_safe_document :base_dir => File.expand_path(File.dirname(__FILE__))
-    reader = Asciidoctor::PreprocessorReader.new doc, input
+    doc = empty_safe_document :base_dir => testdir
+    reader = Asciidoctor::PreprocessorReader.new doc, input, nil, :normalize => true
     block = Asciidoctor::Parser.next_block(reader, doc)
-    output = block.render
+    output = block.convert
     assert_css '.paragraph', output, 1
   end
 
@@ -145,7 +145,7 @@ This line is separated by a horizontal rule...
     bad_variants.each do |variant|
       good_offsets.each do |offset|
         input = <<-EOS
-This line is separated something that is not a horizontal rule...
+This line is separated by something that is not a horizontal rule...
 
 #{offset}#{variant}
 
@@ -170,7 +170,7 @@ This line is separated something that is not a horizontal rule...
     good_variants.each do |variant|
       bad_offsets.each do |offset|
         input = <<-EOS
-This line is separated something that is not a horizontal rule...
+This line is separated by something that is not a horizontal rule...
 
 #{offset}#{variant}
 
@@ -187,7 +187,7 @@ This line is separated something that is not a horizontal rule...
   end
 
   test 'emphasized text with single quote using apostrophe characters' do
-    rsquo = [8217].pack 'U*'
+    rsquo = decode_char 8217
     assert_xpath %(//em[text()="Johnny#{rsquo}s"]), render_string(%q(It's 'Johnny's' phone), :attributes => {'compat-mode' => ''})
     assert_xpath %(//p[text()="It#{rsquo}s 'Johnny#{rsquo}s' phone"]), render_string(%q(It's 'Johnny's' phone))
   end
@@ -286,16 +286,18 @@ This line is separated something that is not a horizontal rule...
       assert_xpath "//code/strong", rendered
     end
 
-    test "unconstrained quotes" do
-      rendered_chars = render_string("**B**__I__++M++", :attributes => {'compat-mode' => ''})
-      assert_xpath "//strong", rendered_chars
-      assert_xpath "//em", rendered_chars
-      assert_xpath "//code", rendered_chars
+    test 'unconstrained quotes' do
+      rendered_chars = render_string('**B**__I__++M++[role]++M++', :attributes => {'compat-mode' => ''})
+      assert_xpath '//strong', rendered_chars, 1
+      assert_xpath '//em', rendered_chars, 1
+      assert_xpath '//code[not(@class)]', rendered_chars, 1
+      assert_xpath '//code[@class="role"]', rendered_chars, 1
 
-      rendered_chars = render_string("**B**__I__``M``")
-      assert_xpath "//strong", rendered_chars
-      assert_xpath "//em", rendered_chars
-      assert_xpath "//code", rendered_chars
+      rendered_chars = render_string('**B**__I__``M``[role]``M``')
+      assert_xpath '//strong', rendered_chars, 1
+      assert_xpath '//em', rendered_chars, 1
+      assert_xpath '//code[not(@class)]', rendered_chars, 1
+      assert_xpath '//code[@class="role"]', rendered_chars, 1
     end
   end
 

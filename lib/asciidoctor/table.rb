@@ -1,7 +1,10 @@
+# encoding: UTF-8
 module Asciidoctor
 # Public: Methods and constants for managing AsciiDoc table content in a document.
 # It supports all three of AsciiDoc's table formats: psv, dsv and csv.
 class Table < AbstractBlock
+  # multipler / divisor for tuning precision of calculated result
+  DEFAULT_PRECISION_FACTOR = 10000.0
 
   # Public: A data object that encapsulates the collection of rows (head, foot, body) for a table
   class Rows
@@ -13,49 +16,19 @@ class Table < AbstractBlock
       @body = body
     end
 
-    alias :[] :send
+    alias [] send
+
+    # Public: Returns the rows grouped by section.
+    #
+    # Creates a 2-dimensional array of two element entries. The first element
+    # is the section name as a symbol. The second element is the Array of rows
+    # in that section. The entries are in document order (head, foot, body).
+    #
+    # Returns a 2-dimentional Array of rows grouped by section.
+    def by_section
+      [[:head, @head], [:body, @body], [:foot, @foot]]
+    end
   end
-
-  # Public: A String key that specifies the default table format in AsciiDoc (psv)
-  DEFAULT_DATA_FORMAT = 'psv'
-
-  # Public: An Array of String keys that represent the table formats in AsciiDoc
-  DATA_FORMATS = ['psv', 'dsv', 'csv']
-
-  # Public: A Hash mapping the AsciiDoc table formats to their default delimiters
-  DEFAULT_DELIMITERS = {
-    'psv' => '|',
-    'dsv' => ':',
-    'csv' => ','
-  }
-
-  # Public: A Hash mapping styles abbreviations to styles that can be applied
-  # to a table column or cell
-  TEXT_STYLES = {
-    'd' => :none,
-    's' => :strong,
-    'e' => :emphasis,
-    'm' => :monospaced,
-    'h' => :header,
-    'l' => :literal,
-    'v' => :verse,
-    'a' => :asciidoc
-  }
-  
-  # Public: A Hash mapping alignment abbreviations to alignments (horizontal
-  # and vertial) that can be applies to a table column or cell
-  ALIGNMENTS = {
-    :h => {
-      '<' => 'left',
-      '>' => 'right',
-      '^' => 'center'
-    },
-    :v => {
-      '<' => 'top',
-      '>' => 'bottom',
-      '^' => 'middle'
-    }
-  }
 
   # Public: Get/Set the columns for this table
   attr_accessor :columns
@@ -67,26 +40,34 @@ class Table < AbstractBlock
   # Public: Boolean specifies whether this table has a header row
   attr_accessor :has_header_option
 
+  # Public: Get the caption for this table
+  attr_reader :caption
+
   def initialize parent, attributes
     super parent, :table
     @rows = Rows.new
     @columns = []
 
-    @has_header_option = attributes.has_key? 'header-option'
+    @has_header_option = attributes.key? 'header-option'
 
-    # smell like we need a utility method here
+    # smells like we need a utility method here
     # to resolve an integer width from potential bogus input
-    pcwidth = attributes['width']
-    pcwidth_intval = pcwidth.to_i.abs
-    if pcwidth_intval == 0 && pcwidth != '0' || pcwidth_intval > 100
+    if (pcwidth = attributes['width'])
+      if (pcwidth_intval = pcwidth.to_i) > 100 || pcwidth_intval < 1
+        pcwidth_intval = 100 unless pcwidth_intval == 0 && (pcwidth == '0' || pcwidth == '0%')
+      end
+    else
       pcwidth_intval = 100
     end
     @attributes['tablepcwidth'] = pcwidth_intval
 
-    if @document.attributes.has_key? 'pagewidth'
+    if @document.attributes.key? 'pagewidth'
+      # FIXME calculate more accurately (only used in DocBook output)
       @attributes['tableabswidth'] ||=
           ((@attributes['tablepcwidth'].to_f / 100) * @document.attributes['pagewidth']).round
     end
+
+    attributes['orientation'] = 'landscape' if attributes.key? 'rotate-option'
   end
 
   # Internal: Returns whether the current row being processed is
@@ -98,21 +79,74 @@ class Table < AbstractBlock
   # Internal: Creates the Column objects from the column spec
   #
   # returns nothing
-  def create_columns(col_specs)
-    total_width = 0
+  def create_columns colspecs
     cols = []
-    col_specs.each do |col_spec|
-      total_width += col_spec['width']
-      cols << Column.new(self, cols.size, col_spec)
+    autowidth_cols = nil
+    width_base = 0
+    colspecs.each do |colspec|
+      colwidth = colspec['width']
+      cols << (Column.new self, cols.size, colspec)
+      if colwidth < 0
+        (autowidth_cols ||= []) << cols[-1]
+      else
+        width_base += colwidth
+      end
+    end
+    if (num_cols = (@columns = cols).size) > 0
+      @attributes['colcount'] = num_cols
+      width_base = nil unless width_base > 0 || autowidth_cols
+      assign_column_widths width_base, autowidth_cols
+    end
+    nil
+  end
+
+  # Internal: Assign column widths to columns
+  #
+  # This method rounds the percentage width values to 4 decimal places and
+  # donates the balance to the final column.
+  #
+  # This method assumes there's at least one column in the columns array.
+  #
+  # width_base - the total of the relative column values used for calculating percentage widths (default: nil)
+  #
+  # returns nothing
+  def assign_column_widths width_base = nil, autowidth_cols = nil
+    pf = DEFAULT_PRECISION_FACTOR
+    total_width = col_pcwidth = 0
+
+    if width_base
+      if autowidth_cols
+        if width_base > 100
+          autowidth = 0
+          logger.warn %(total column width must not exceed 100% when using autowidth columns; got #{width_base}%)
+        else
+          autowidth = ((100.0 - width_base) / autowidth_cols.size * pf).to_i / pf
+          autowidth = autowidth.to_i if autowidth.to_i == autowidth
+          width_base = 100
+        end
+        autowidth_attrs = { 'width' => autowidth, 'autowidth-option' => '' }
+        autowidth_cols.each {|col| col.update_attributes autowidth_attrs }
+      end
+      @columns.each {|col| total_width += (col_pcwidth = col.assign_width nil, width_base, pf) }
+    else
+      col_pcwidth = ((100 * pf / @columns.size).to_i) / pf
+      # or...
+      #col_pcwidth = (100.0 / @columns.size).truncate 4
+      col_pcwidth = col_pcwidth.to_i if col_pcwidth.to_i == col_pcwidth
+      @columns.each {|col| total_width += col.assign_width col_pcwidth }
     end
 
-    unless cols.empty?
-      @attributes['colcount'] = cols.size
-      even_width = (100.0 / cols.size).floor
-      cols.each {|c| c.assign_width(total_width, even_width) }
+    # donate balance, if any, to final column (using half up rounding)
+    unless total_width == 100
+      @columns[-1].assign_width(((100 - total_width + col_pcwidth) * pf).round / pf)
+      # or (manual half up rounding)...
+      #numerator = (raw_numerator = (100 - total_width + col_pcwidth) * pf).to_i
+      #numerator += 1 if raw_numerator >= numerator + 0.5
+      #@columns[-1].assign_width numerator / pf
+      # or...
+      #@columns[-1].assign_width((100 - total_width + col_pcwidth).round 4)
     end
 
-    @columns = cols
     nil
   end
 
@@ -120,7 +154,7 @@ class Table < AbstractBlock
   # by the options on the table
   #
   # returns nothing
-  def partition_header_footer(attributes)
+  def partition_header_footer(attrs)
     # set rowcount before splitting up body rows
     @attributes['rowcount'] = @rows.body.size
 
@@ -135,10 +169,10 @@ class Table < AbstractBlock
       @rows.head = [head]
     end
 
-    if num_body_rows > 0 && attributes.has_key?('footer-option')
+    if num_body_rows > 0 && attrs.key?('footer-option')
       @rows.foot = [@rows.body.pop]
     end
-    
+
     nil
   end
 end
@@ -160,32 +194,39 @@ class Table::Column < AbstractNode
   end
 
   # Public: An alias to the parent block (which is always a Table)
-  alias :table :parent
+  alias table parent
 
   # Internal: Calculate and assign the widths (percentage and absolute) for this column
   #
   # This method assigns the colpcwidth and colabswidth attributes.
   #
-  # returns nothing
-  def assign_width(total_width, even_width)
-    if total_width > 0
-      width = ((@attributes['width'].to_f / total_width) * 100).floor
-    else
-      width = even_width
+  # returns the resolved colpcwidth value
+  def assign_width col_pcwidth, width_base = nil, pf = 10000.0
+    if width_base
+      col_pcwidth = ((@attributes['width'].to_f / width_base) * 100 * pf).to_i / pf
+      # or...
+      #col_pcwidth = (@attributes['width'].to_f * 100.0 / width_base).truncate 4
+      col_pcwidth = col_pcwidth.to_i if col_pcwidth.to_i == col_pcwidth
     end
-    @attributes['colpcwidth'] = width
-    if parent.attributes.has_key? 'tableabswidth'
-      @attributes['colabswidth'] = ((width.to_f / 100) * parent.attributes['tableabswidth']).round
+    @attributes['colpcwidth'] = col_pcwidth
+    if parent.attributes.key? 'tableabswidth'
+      # FIXME calculate more accurately (only used in DocBook output)
+      @attributes['colabswidth'] = ((col_pcwidth / 100.0) * parent.attributes['tableabswidth']).round
     end
-
-    nil
+    col_pcwidth
   end
 end
 
 # Public: Methods for managing the a cell in an AsciiDoc table.
 class Table::Cell < AbstractNode
+  # Public: Gets/Sets the location in the AsciiDoc source where this cell begins
+  attr_reader :source_location
+
   # Public: Get/Set the Symbol style for this cell (default: nil)
   attr_accessor :style
+
+  # Public: Substitutions to be applied to content in this cell
+  attr_accessor :subs
 
   # Public: An Integer of the number of columns this cell will span (default: nil)
   attr_accessor :colspan
@@ -194,58 +235,115 @@ class Table::Cell < AbstractNode
   attr_accessor :rowspan
 
   # Public: An alias to the parent block (which is always a Column)
-  alias :column :parent
+  alias column parent
 
   # Public: The internal Asciidoctor::Document for a cell that has the asciidoc style
   attr_reader :inner_document
 
-  def initialize column, text, attributes = {}, cursor = nil
+  def initialize column, cell_text, attributes = {}, opts = {}
     super column, :cell
-    @text = text
-    @style = nil
-    @colspan = nil
-    @rowspan = nil
-    # TODO feels hacky
+    @source_location = opts[:cursor].dup if @document.sourcemap
     if column
-      @style = column.attributes['style']
-      update_attributes(column.attributes)
+      cell_style = column.attributes['style'] unless (in_header_row = column.table.header_row?)
+      # REVIEW feels hacky to inherit all attributes from column
+      update_attributes column.attributes
     end
+    # NOTE if attributes is defined, we know this is a psv cell; implies text needs to be stripped
     if attributes
-      @colspan = attributes.delete('colspan')
-      @rowspan = attributes.delete('rowspan')
-      # TODO eventualy remove the style attribute from the attributes hash
-      #@style = attributes.delete('style') if attributes.has_key? 'style'
-      @style = attributes['style'] if attributes.has_key? 'style'
-      update_attributes(attributes)
+      if attributes.empty?
+        @colspan = @rowspan = nil
+      else
+        @colspan, @rowspan = (attributes.delete 'colspan'), (attributes.delete 'rowspan')
+        # TODO delete style attribute from @attributes if set
+        cell_style = attributes['style'] || cell_style unless in_header_row
+        update_attributes attributes
+      end
+      if cell_style == :asciidoc
+        asciidoc = true
+        inner_document_cursor = opts[:cursor]
+        if (cell_text = cell_text.rstrip).start_with? LF
+          lines_advanced = 1
+          lines_advanced += 1 while (cell_text = cell_text.slice 1, cell_text.length).start_with? LF
+          # NOTE this only works if we remain in the same file
+          inner_document_cursor.advance lines_advanced
+        else
+          cell_text = cell_text.lstrip
+        end
+      elsif (literal = cell_style == :literal) || cell_style == :verse
+        cell_text = cell_text.rstrip
+        # QUESTION should we use same logic as :asciidoc cell? strip leading space if text doesn't start with newline?
+        cell_text = cell_text.slice 1, cell_text.length while cell_text.start_with? LF
+      else
+        normal_psv = true
+        # NOTE AsciidoctorJ uses nil cell_text to create an empty cell
+        cell_text = cell_text ? cell_text.strip : ''
+      end
+    else
+      @colspan = @rowspan = nil
+      if cell_style == :asciidoc
+        asciidoc = true
+        inner_document_cursor = opts[:cursor]
+      end
     end
-    # only allow AsciiDoc cells in non-header rows
-    if @style == :asciidoc && !column.table.header_row?
+    # NOTE only true for non-header rows
+    if asciidoc
       # FIXME hide doctitle from nested document; temporary workaround to fix
       # nested document seeing doctitle and assuming it has its own document title
       parent_doctitle = @document.attributes.delete('doctitle')
       # NOTE we need to process the first line of content as it may not have been processed
       # the included content cannot expect to match conditional terminators in the remaining
       # lines of table cell content, it must be self-contained logic
-      inner_document_lines = @text.split(EOL)
-      unless inner_document_lines.empty? || !inner_document_lines[0].include?('::')
-        unprocessed_lines = inner_document_lines[0]
-        processed_lines = PreprocessorReader.new(@document, unprocessed_lines).readlines
-        if processed_lines != unprocessed_lines
+      # QUESTION should we reset cell_text to nil?
+      # QUESTION is is faster to check for :: before splitting?
+      inner_document_lines = cell_text.split LF, -1
+      if (unprocessed_line1 = inner_document_lines[0]).include? '::'
+        preprocessed_lines = (PreprocessorReader.new @document, [unprocessed_line1]).readlines
+        unless unprocessed_line1 == preprocessed_lines[0] && preprocessed_lines.size < 2
           inner_document_lines.shift
-          inner_document_lines.unshift(*processed_lines)
+          inner_document_lines.unshift(*preprocessed_lines) unless preprocessed_lines.empty?
         end
-      end
-      @inner_document = Document.new(inner_document_lines, :header_footer => false, :parent => @document, :cursor => cursor)
+      end unless inner_document_lines.empty?
+      @inner_document = Document.new(inner_document_lines, :header_footer => false, :parent => @document, :cursor => inner_document_cursor)
       @document.attributes['doctitle'] = parent_doctitle unless parent_doctitle.nil?
+      @subs = nil
+    elsif literal
+      @subs = BASIC_SUBS
+    else
+      if normal_psv && (cell_text.start_with? '[[') && LeadingInlineAnchorRx =~ cell_text
+        Parser.catalog_inline_anchor $1, $2, self, opts[:cursor], @document
+      end
+      @subs = NORMAL_SUBS
     end
+    @text = cell_text
+    @style = cell_style
   end
 
-  # Public: Get the text with normal substitutions applied for this cell. Used for cells in the head rows
+  # Public: Get the String text of this cell with substitutions applied.
+  #
+  # Used for cells in the head row as well as text-only (non-AsciiDoc) cells in
+  # the foot row and body.
+  #
+  # This method shouldn't be used for cells that have the AsciiDoc style.
+  #
+  # Returns the converted String text for this Cell
   def text
-    apply_normal_subs(@text).strip
+    apply_subs @text, @subs
+  end
+
+  # Public: Set the String text.
+  #
+  # This method shouldn't be used for cells that have the AsciiDoc style.
+  #
+  # Returns the new String text assigned to this Cell
+  def text= val
+    @text = val
   end
 
   # Public: Handles the body data (tbody, tfoot), applying styles and partitioning into paragraphs
+  #
+  # This method should not be used for cells in the head row or that have the literal or verse style.
+  #
+  # Returns the converted String for this Cell
   def content
     if @style == :asciidoc
       @inner_document.convert
@@ -254,6 +352,16 @@ class Table::Cell < AbstractNode
         !@style || @style == :header ? p : Inline.new(parent, :quoted, p, :type => @style).convert
       end
     end
+  end
+
+  # Public: Get the source file where this block started
+  def file
+    @source_location && @source_location.file
+  end
+
+  # Public: Get the source line number where this block started
+  def lineno
+    @source_location && @source_location.lineno
   end
 
   def to_s
@@ -268,19 +376,34 @@ end
 # instantiated, the row is closed if the cell satisifies the column count and,
 # finally, a new buffer is allocated to track the next cell.
 class Table::ParserContext
+  include Logging
+
+  # Public: An Array of String keys that represent the table formats in AsciiDoc
+  #--
+  # QUESTION should we recognize !sv as a valid format value?
+  FORMATS = ['psv', 'csv', 'dsv', 'tsv'].to_set
+
+  # Public: A Hash mapping the AsciiDoc table formats to default delimiters
+  DELIMITERS = {
+    'psv' => ['|', /\|/],
+    'csv' => [',', /,/],
+    'dsv' => [':', /:/],
+    'tsv' => [%(\t), /\t/],
+    '!sv' => ['!', /!/]
+  }
 
   # Public: The Table currently being parsed
   attr_accessor :table
 
-  # Public: The AsciiDoc table format (psv, dsv or csv)
+  # Public: The AsciiDoc table format (psv, dsv, or csv)
   attr_accessor :format
 
   # Public: Get the expected column count for a row
   #
-  # col_count is the number of columns to pull into a row
+  # colcount is the number of columns to pull into a row
   # A value of -1 means we use the number of columns found
-  # in the first line as the col_count
-  attr_reader :col_count
+  # in the first line as the colcount
+  attr_reader :colcount
 
   # Public: The String buffer of the currently open cell
   attr_accessor :buffer
@@ -291,31 +414,45 @@ class Table::ParserContext
   # Public: The cell delimiter compiled Regexp for this table.
   attr_reader :delimiter_re
 
-  def initialize(reader, table, attributes = {})
-    @reader = reader
+  def initialize reader, table, attributes = {}
+    @start_cursor_data = (@reader = reader).mark
     @table = table
-    # TODO if reader.cursor becomes a reference, this would require .dup
-    @last_cursor = reader.cursor
-    if (@format = attributes['format'])
-      unless Table::DATA_FORMATS.include? @format
-        raise %(Illegal table format: #{@format})
+
+    if attributes.key? 'format'
+      if FORMATS.include?(xsv = attributes['format'])
+        if xsv == 'tsv'
+          # NOTE tsv is just an alias for csv with a tab separator
+          @format = 'csv'
+        elsif (@format = xsv) == 'psv' && table.document.nested?
+          xsv = '!sv'
+        end
+      else
+        logger.error message_with_context %(illegal table format: #{xsv}), :source_location => reader.cursor_at_prev_line
+        @format, xsv = 'psv', (table.document.nested? ? '!sv' : 'psv')
       end
     else
-      @format = Table::DEFAULT_DATA_FORMAT
+      @format, xsv = 'psv', (table.document.nested? ? '!sv' : 'psv')
     end
 
-    @delimiter = if @format == 'psv' && !(attributes.has_key? 'separator') && table.document.nested?
-      '!'
+    if attributes.key? 'separator'
+      if (sep = attributes['separator']).nil_or_empty?
+        @delimiter, @delimiter_re = DELIMITERS[xsv]
+      # QUESTION should we support any other escape codes or multiple tabs?
+      elsif sep == '\t'
+        @delimiter, @delimiter_re = DELIMITERS['tsv']
+      else
+        @delimiter, @delimiter_re = sep, /#{::Regexp.escape sep}/
+      end
     else
-      attributes['separator'] || Table::DEFAULT_DELIMITERS[@format]
+      @delimiter, @delimiter_re = DELIMITERS[xsv]
     end
-    @delimiter_re = /#{Regexp.escape @delimiter}/
-    @col_count = table.columns.empty? ? -1 : table.columns.size
+
+    @colcount = table.columns.empty? ? -1 : table.columns.size
     @buffer = ''
-    @cell_specs = []
+    @cellspecs = []
     @cell_open = false
     @active_rowspans = [0]
-    @col_visits = 0
+    @column_visits = 0
     @current_row = []
     @linenum = -1
   end
@@ -336,31 +473,38 @@ class Table::ParserContext
     @delimiter_re.match(line)
   end
 
-  # Public: Skip beyond the matched delimiter because it was a false positive
-  # (either because it was escaped or in a quoted context)
+  # Public: Skip past the matched delimiter because it's inside quoted text.
   #
-  # returns the String after the match
-  def skip_matched_delimiter(match, escaped = false)
-    @buffer = %(#{@buffer}#{escaped ? match.pre_match.chop : match.pre_match}#{@delimiter})
-    match.post_match
+  # Returns nothing
+  def skip_past_delimiter(pre)
+    @buffer = %(#{@buffer}#{pre}#{@delimiter})
+    nil
+  end
+
+  # Public: Skip past the matched delimiter because it's escaped.
+  #
+  # Returns nothing
+  def skip_past_escaped_delimiter(pre)
+    @buffer = %(#{@buffer}#{pre.chop}#{@delimiter})
+    nil
   end
 
   # Public: Determines whether the buffer has unclosed quotes. Used for CSV data.
   #
-  # returns true if the buffer has unclosed quotes, false if it doesn't or it 
+  # returns true if the buffer has unclosed quotes, false if it doesn't or it
   # isn't quoted data
-  def buffer_has_unclosed_quotes?(append = nil)
-    record = %(#{@buffer}#{append}).strip
-    record.start_with?('"') && !record.start_with?('""') && !record.end_with?('"')
-  end
-
-  # Public: Determines whether the buffer contains quoted data. Used for CSV data.
-  #
-  # returns true if the buffer starts with a double quote (and not an escaped double quote),
-  # false otherwise
-  def buffer_quoted?
-    @buffer = @buffer.lstrip
-    @buffer.start_with?('"') && !@buffer.start_with?('""')
+  def buffer_has_unclosed_quotes? append = nil
+    if (record = append ? (@buffer + append).strip : @buffer.strip) == '"'
+      true
+    elsif record.start_with? '"'
+      if ((trailing_quote = record.end_with? '"') && (record.end_with? '""')) || (record.start_with? '""')
+        ((record = record.gsub '""', '').start_with? '"') && !(record.end_with? '"')
+      else
+        !trailing_quote
+      end
+    else
+      false
+    end
   end
 
   # Public: Takes a cell spec from the stack. Cell specs precede the delimiter, so a
@@ -368,17 +512,17 @@ class Table::ParserContext
   # when the cell is being closed.
   #
   # returns The cell spec Hash captured from parsing the previous cell
-  def take_cell_spec()
-    @cell_specs.shift
+  def take_cellspec
+    @cellspecs.shift
   end
 
   # Public: Puts a cell spec onto the stack. Cell specs precede the delimiter, so a
   # stack is used to carry over the spec to the next cell.
   #
   # returns nothing
-  def push_cell_spec(cell_spec = {})
+  def push_cellspec(cellspec = {})
     # this shouldn't be nil, but we check anyway
-    @cell_specs << (cell_spec || {})
+    @cellspecs << (cellspec || {})
     nil
   end
 
@@ -419,8 +563,8 @@ class Table::ParserContext
   # by the next cell.
   #
   # returns nothing
-  def close_open_cell(next_cell_spec = {})
-    push_cell_spec next_cell_spec
+  def close_open_cell(next_cellspec = {})
+    push_cellspec next_cellspec
     close_cell(true) if cell_open?
     advance
     nil
@@ -432,61 +576,65 @@ class Table::ParserContext
   #
   # returns nothing
   def close_cell(eol = false)
-    cell_text = @buffer.strip
-    @buffer = ''
     if @format == 'psv'
-      cell_spec = take_cell_spec
-      if cell_spec.nil?
-        warn "asciidoctor: ERROR: #{@last_cursor.line_info}: table missing leading separator, recovering automatically"
-        cell_spec = {}
-        repeat = 1
+      cell_text = @buffer
+      @buffer = ''
+      if (cellspec = take_cellspec)
+        repeat = cellspec.delete('repeatcol') || 1
       else
-        repeat = cell_spec.fetch('repeatcol', 1)
-        cell_spec.delete('repeatcol')
+        logger.error message_with_context 'table missing leading separator; recovering automatically', :source_location => Reader::Cursor.new(*@start_cursor_data)
+        cellspec = {}
+        repeat = 1
       end
     else
-      cell_spec = nil
+      cell_text = @buffer.strip
+      @buffer = ''
+      cellspec = nil
       repeat = 1
       if @format == 'csv'
         if !cell_text.empty? && cell_text.include?('"')
           # this may not be perfect logic, but it hits the 99%
           if cell_text.start_with?('"') && cell_text.end_with?('"')
             # unquote
-            cell_text = cell_text[1...-1].strip
+            cell_text = cell_text.slice(1, cell_text.length - 2).strip
           end
-          
-          # collapses escaped quotes
-          cell_text = cell_text.tr_s('"', '"')
+
+          # collapse escaped quotes
+          cell_text = cell_text.squeeze('"')
         end
       end
     end
 
     1.upto(repeat) do |i|
-      # make column resolving an operation
-      if @col_count == -1
-        @table.columns << (column = Table::Column.new(@table, @current_row.size + i - 1))
-        if cell_spec && (cell_spec.has_key? 'colspan') && (extra_cols = cell_spec['colspan'].to_i - 1) > 0
+      # TODO make column resolving an operation
+      if @colcount == -1
+        @table.columns << (column = Table::Column.new(@table, @table.columns.size + i - 1))
+        if cellspec && (cellspec.key? 'colspan') && (extra_cols = cellspec['colspan'].to_i - 1) > 0
+          offset = @table.columns.size
           extra_cols.times do |j|
-            @table.columns << Table::Column.new(@table, @current_row.size + i + j - 1)
+            @table.columns << Table::Column.new(@table, offset + j)
           end
         end
       else
         # QUESTION is this right for cells that span columns?
-        column = @table.columns[@current_row.size]
+        unless (column = @table.columns[@current_row.size])
+          logger.error message_with_context 'dropping cell because it exceeds specified number of columns', :source_location => @reader.cursor_before_mark
+          return
+        end
       end
 
-      cell = Table::Cell.new(column, cell_text, cell_spec, @last_cursor)
-      @last_cursor = @reader.cursor
+      cell = Table::Cell.new(column, cell_text, cellspec, :cursor => @reader.cursor_before_mark)
+      @reader.mark
       unless !cell.rowspan || cell.rowspan == 1
         activate_rowspan(cell.rowspan, (cell.colspan || 1))
       end
-      @col_visits += (cell.colspan || 1)
+      @column_visits += (cell.colspan || 1)
       @current_row << cell
       # don't close the row if we're on the first line and the column count has not been set explicitly
-      # TODO perhaps the col_count/linenum logic should be in end_of_row? (or a should_end_row? method)
-      close_row if end_of_row? && (@col_count != -1 || @linenum > 0 || (eol && i == repeat))
+      # TODO perhaps the colcount/linenum logic should be in end_of_row? (or a should_end_row? method)
+      close_row if end_of_row? && (@colcount != -1 || @linenum > 0 || (eol && i == repeat))
     end
-    @open_cell = false
+    @cell_open = false
     nil
   end
 
@@ -498,8 +646,8 @@ class Table::ParserContext
     @table.rows.body << @current_row
     # don't have to account for active rowspans here
     # since we know this is first row
-    @col_count = @col_visits if @col_count == -1
-    @col_visits = 0
+    @colcount = @column_visits if @colcount == -1
+    @column_visits = 0
     @current_row = []
     @active_rowspans.shift
     @active_rowspans[0] ||= 0
@@ -520,13 +668,13 @@ class Table::ParserContext
 
   # Public: Check whether we've met the number of effective columns for the current row.
   def end_of_row?
-    @col_count == -1 || effective_col_visits == @col_count
+    @colcount == -1 || effective_column_visits == @colcount
   end
 
   # Public: Calculate the effective column visits, which consists of the number of
   # cells plus any active rowspans.
-  def effective_col_visits
-    @col_visits + @active_rowspans[0]
+  def effective_column_visits
+    @column_visits + @active_rowspans[0]
   end
 
   # Internal: Advance to the next line (which may come after the parser begins processing
@@ -534,6 +682,5 @@ class Table::ParserContext
   def advance
     @linenum += 1
   end
-
 end
 end

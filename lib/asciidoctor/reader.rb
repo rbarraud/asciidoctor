@@ -1,24 +1,25 @@
+# encoding: UTF-8
 module Asciidoctor
 # Public: Methods for retrieving lines from AsciiDoc source files
 class Reader
+  include Logging
+
   class Cursor
-    attr_accessor :file
-    attr_accessor :dir
-    attr_accessor :path
-    attr_accessor :lineno
-  
-    def initialize file, dir = nil, path = nil, lineno = nil
-      @file = file
-      @dir = dir
-      @path = path
-      @lineno = lineno
+    attr_reader :file, :dir, :path, :lineno
+
+    def initialize file, dir = nil, path = nil, lineno = 1
+      @file, @dir, @path, @lineno = file, dir, path, lineno
+    end
+
+    def advance num
+      @lineno += num
     end
 
     def line_info
-      %(#{path}: line #{lineno})
+      %(#{@path}: line #{@lineno})
     end
 
-    alias :to_s :line_info
+    alias to_s line_info
   end
 
   attr_reader :file
@@ -34,39 +35,37 @@ class Reader
   # Public: Control whether lines are processed using Reader#process_line on first visit (default: true)
   attr_accessor :process_lines
 
+  # Public: Indicates that the end of the reader was reached with a delimited block still open.
+  attr_accessor :unterminated
+
   # Public: Initialize the Reader object
-  def initialize data = nil, cursor = nil, opts = {:normalize => false}
+  def initialize data = nil, cursor = nil, opts = {}
     if !cursor
-      @file = @dir = nil
+      @file = nil
+      @dir = '.'
       @path = '<stdin>'
       @lineno = 1 # IMPORTANT lineno assignment must proceed prepare_lines call!
-    elsif cursor.is_a? ::String
+    elsif ::String === cursor
       @file = cursor
       @dir, @path = ::File.split @file
       @lineno = 1 # IMPORTANT lineno assignment must proceed prepare_lines call!
     else
-      @file = cursor.file
-      @dir = cursor.dir
-      @path = cursor.path || '<stdin>'
-      if @file
-        unless @dir
-          # REVIEW might to look at this assignment closer
-          @dir = ::File.dirname @file
-          @dir = nil if @dir == '.' # right?
-        end
-
-        unless cursor.path
-          @path = ::File.basename @file
-        end
+      if (@file = cursor.file)
+        @dir = cursor.dir || (::File.dirname @file)
+        @path = cursor.path || (::File.basename @file)
+      else
+        @dir = cursor.dir || '.'
+        @path = cursor.path || '<stdin>'
       end
       @lineno = cursor.lineno || 1 # IMPORTANT lineno assignment must proceed prepare_lines call!
     end
     @lines = data ? (prepare_lines data, opts) : []
-    @source_lines = @lines.dup
-    @eof = @lines.empty?
+    @source_lines = @lines.drop 0
+    @mark = nil
     @look_ahead = 0
     @process_lines = true
     @unescape_next_line = false
+    @unterminated = nil
   end
 
   # Internal: Prepare the lines from the provided data
@@ -83,18 +82,16 @@ class Reader
   #
   # Returns The String lines extracted from the data
   def prepare_lines data, opts = {}
-    if data.is_a? ::String
+    if ::String === data
       if opts[:normalize]
         Helpers.normalize_lines_from_string data
       else
-        data.split EOL
+        data.split LF, -1
       end
+    elsif opts[:normalize]
+      Helpers.normalize_lines_array data
     else
-      if opts[:normalize]
-        Helpers.normalize_lines_array data
-      else
-        data.dup
-      end
+      data.drop 0
     end
   end
 
@@ -120,8 +117,26 @@ class Reader
   #
   # Returns True if there are more lines, False if there are not.
   def has_more_lines?
-    !(@eof || (@eof = peek_line.nil?))
+    if @lines.empty?
+      @look_ahead = 0
+      false
+    else
+      true
+    end
   end
+
+  # Public: Check whether this reader is empty (contains no lines)
+  #
+  # Returns true if there are no more lines to peek, otherwise false.
+  def empty?
+    if @lines.empty?
+      @look_ahead = 0
+      true
+    else
+      false
+    end
+  end
+  alias eof? empty?
 
   # Public: Peek at the next line and check if it's empty (i.e., whitespace only)
   #
@@ -132,41 +147,39 @@ class Reader
     peek_line.nil_or_empty?
   end
 
-  # Public: Peek at the next line of source data. Processes the line, if not
+  # Public: Peek at the next line of source data. Processes the line if not
   # already marked as processed, but does not consume it.
   #
   # This method will probe the reader for more lines. If there is a next line
   # that has not previously been visited, the line is passed to the
   # Reader#process_line method to be initialized. This call gives
-  # sub-classess the opportunity to do preprocessing. If the return value of
+  # sub-classes the opportunity to do preprocessing. If the return value of
   # the Reader#process_line is nil, the data is assumed to be changed and
   # Reader#peek_line is invoked again to perform further processing.
+  #
+  # If has_more_lines? is called immediately before peek_line, the direct flag
+  # is implicitly true (since the line is flagged as visited).
   #
   # direct  - A Boolean flag to bypasses the check for more lines and immediately
   #           returns the first element of the internal @lines Array. (default: false)
   #
   # Returns the next line of the source data as a String if there are lines remaining.
-  # Returns nil if there is no more data.
+  # Returns nothing if there is no more data.
   def peek_line direct = false
     if direct || @look_ahead > 0
       @unescape_next_line ? @lines[0][1..-1] : @lines[0]
-    elsif @eof || @lines.empty?
-      @eof = true
+    elsif @lines.empty?
       @look_ahead = 0
       nil
     else
       # FIXME the problem with this approach is that we aren't
       # retaining the modified line (hence the @unescape_next_line tweak)
-      # perhaps we need a stack of proxy lines
-      if !(line = process_line @lines[0])
-        peek_line
-      else
-        line
-      end
+      # perhaps we need a stack of proxied lines
+      (line = process_line @lines[0]) ? line : peek_line
     end
   end
 
-  # Public: Peek at the next multiple lines of source data. Processes the lines, if not
+  # Public: Peek at the next multiple lines of source data. Processes the lines if not
   # already marked as processed, but does not consume them.
   #
   # This method delegates to Reader#read_line to process and collect the line, then
@@ -174,24 +187,25 @@ class Reader
   # be processed and marked as such so that subsequent reads will not need to process
   # the lines again.
   #
-  # num    - The Integer number of lines to peek.
-  # direct - A Boolean indicating whether processing should be disabled when reading lines
+  # num    - The positive Integer number of lines to peek or nil to peek all lines (default: nil).
+  # direct - A Boolean indicating whether processing should be disabled when reading lines (default: false).
   #
   # Returns A String Array of the next multiple lines of source data, or an empty Array
   # if there are no more lines in this Reader.
-  def peek_lines num = 1, direct = true
+  def peek_lines num = nil, direct = false
     old_look_ahead = @look_ahead
     result = []
-    num.times do
-      if (line = read_line direct)
+    (num || MAX_INT).times do
+      if (line = direct ? shift : read_line)
         result << line
       else
+        @lineno -= 1 if direct
         break
       end
     end
 
     unless result.empty?
-      result.reverse_each {|line| unshift line }
+      unshift_all result
       @look_ahead = old_look_ahead if direct
     end
 
@@ -200,17 +214,11 @@ class Reader
 
   # Public: Get the next line of source data. Consumes the line returned.
   #
-  # direct  - A Boolean flag to bypasses the check for more lines and immediately
-  #           returns the first element of the internal @lines Array. (default: false)
-  #
   # Returns the String of the next line of the source data if data is present.
-  # Returns nil if there is no more data.
-  def read_line direct = false
-    if direct || @look_ahead > 0 || has_more_lines?
-      shift
-    else
-      nil
-    end
+  # Returns nothing if there is no more data.
+  def read_line
+    # has_more_lines? triggers preprocessor
+    shift if @look_ahead > 0 || has_more_lines?
   end
 
   # Public: Get the remaining lines of source data.
@@ -223,12 +231,13 @@ class Reader
   # Returns the lines read as a String Array
   def read_lines
     lines = []
+    # has_more_lines? triggers preprocessor
     while has_more_lines?
       lines << shift
     end
     lines
   end
-  alias :readlines :read_lines
+  alias readlines read_lines
 
   # Public: Get the remaining lines of source data joined as a String.
   #
@@ -236,132 +245,136 @@ class Reader
   #
   # Returns the lines read joined as a String
   def read
-    read_lines * EOL
+    read_lines.join LF
   end
 
   # Public: Advance to the next line by discarding the line at the front of the stack
   #
-  # direct  - A Boolean flag to bypasses the check for more lines and immediately
-  #           returns the first element of the internal @lines Array. (default: true)
-  #
-  # returns a Boolean indicating whether there was a line to discard.
-  def advance direct = true
-    !!read_line(direct)
+  # Returns a Boolean indicating whether there was a line to discard.
+  def advance
+    shift ? true : false
   end
 
   # Public: Push the String line onto the beginning of the Array of source data.
   #
-  # Since this line was (assumed to be) previously retrieved through the
-  # reader, it is marked as seen.
+  # A line pushed on the reader using this method is not processed again. The
+  # method assumes the line was previously retrieved from the reader or does
+  # not otherwise contain preprocessor directives. Therefore, it is marked as
+  # processed immediately.
   #
-  # returns nil
+  # line_to_restore - the line to restore onto the stack
+  #
+  # Returns nothing.
   def unshift_line line_to_restore
     unshift line_to_restore
     nil
   end
-  alias :restore_line :unshift_line
+  alias restore_line unshift_line
 
   # Public: Push an Array of lines onto the front of the Array of source data.
   #
-  # Since these lines were (assumed to be) previously retrieved through the
-  # reader, they are marked as seen.
+  # Lines pushed on the reader using this method are not processed again. The
+  # method assumes the lines were previously retrieved from the reader or do
+  # not otherwise contain preprocessor directives. Therefore, they are marked
+  # as processed immediately.
   #
-  # Returns nil
+  # Returns nothing.
   def unshift_lines lines_to_restore
-    # QUESTION is it faster to use unshift(*lines_to_restore)?
-    lines_to_restore.reverse_each {|line| unshift line }
+    unshift_all lines_to_restore
     nil
   end
-  alias :restore_lines :unshift_lines
+  alias restore_lines unshift_lines
 
-  # Public: Replace the current line with the specified line.
+  # Public: Replace the next line with the specified line.
   #
   # Calls Reader#advance to consume the current line, then calls
   # Reader#unshift to push the replacement onto the top of the
   # line stack.
   #
-  # replacement  - The String line to put in place of the line at the cursor.
+  # replacement - The String line to put in place of the next line (i.e., the line at the cursor).
   #
-  # Returns nothing.
-  def replace_line replacement
-    advance
+  # Returns true.
+  def replace_next_line replacement
+    shift
     unshift replacement
-    nil
+    true
   end
+  # deprecated
+  alias replace_line replace_next_line
 
-  # Public: Strip off leading blank lines in the Array of lines.
+  # Public: Skip blank lines at the cursor.
   #
   # Examples
   #
-  #   @lines
+  #   reader.lines
   #   => ["", "", "Foo", "Bar", ""]
-  #
-  #   skip_blank_lines
+  #   reader.skip_blank_lines
   #   => 2
-  #
-  #   @lines
+  #   reader.lines
   #   => ["Foo", "Bar", ""]
   #
-  # Returns an Integer of the number of lines skipped
+  # Returns the [Integer] number of lines skipped or nothing if all lines have
+  # been consumed (even if lines were skipped by this method).
   def skip_blank_lines
-    return 0 if eof?
+    return if empty?
 
     num_skipped = 0
     # optimized code for shortest execution path
     while (next_line = peek_line)
       if next_line.empty?
-        advance
+        shift
         num_skipped += 1
       else
         return num_skipped
       end
     end
-
-    num_skipped
   end
 
-  # Public: Skip consecutive lines containing line comments and return them.
+  # Public: Skip consecutive comment lines and block comments.
   #
   # Examples
   #   @lines
   #   => ["// foo", "bar"]
   #
   #   comment_lines = skip_comment_lines
-  #   => ["// foo"]
+  #   => nil
   #
   #   @lines
   #   => ["bar"]
   #
-  # Returns the Array of lines that were skipped
-  def skip_comment_lines opts = {}
-    return [] if eof?
+  # Returns nothing
+  def skip_comment_lines
+    return if empty?
 
-    comment_lines = []
-    include_blank_lines = opts[:include_blank_lines]
-    while (next_line = peek_line)
-      if include_blank_lines && next_line.empty?
-        comment_lines << shift
-      elsif (commentish = next_line.start_with?('//')) && (match = CommentBlockRx.match(next_line))
-        comment_lines << shift
-        comment_lines.push(*(read_lines_until(:terminator => match[0], :read_last_line => true, :skip_processing => true)))
-      elsif commentish && CommentLineRx =~ next_line
-        comment_lines << shift
+    while (next_line = peek_line) && !next_line.empty?
+      if next_line.start_with? '//'
+        if next_line.start_with? '///'
+          if (ll = next_line.length) > 3 && next_line == '/' * ll
+            read_lines_until :terminator => next_line, :skip_first_line => true, :read_last_line => true, :skip_processing => true, :context => :comment
+          else
+            break
+          end
+        else
+          shift
+        end
       else
         break
       end
     end
 
-    comment_lines
+    nil
   end
 
-  # Public: Skip consecutive lines that are line comments and return them.
+  # Public: Skip consecutive comment lines and return them.
+  #
+  # This method assumes the reader only contains simple lines (no blocks).
   def skip_line_comments
-    return [] if eof?
+    return [] if empty?
 
     comment_lines = []
     # optimized code for shortest execution path
-    while (next_line = peek_line)
-      if CommentLineRx =~ next_line
+    while (next_line = peek_line) && !next_line.empty?
+      if (next_line.start_with? '//')
         comment_lines << shift
       else
         break
@@ -377,26 +390,21 @@ class Reader
   def terminate
     @lineno += @lines.size
     @lines.clear
-    @eof = true
     @look_ahead = 0
     nil
   end
-
-  # Public: Check whether this reader is empty (contains no lines)
-  #
-  # Returns true if there are no more lines to peek, otherwise false.
-  def eof?
-    !has_more_lines?
-  end
-  alias :empty? :eof?
 
   # Public: Return all the lines from `@lines` until we (1) run out them,
   #   (2) find a blank line with :break_on_blank_lines => true, or (3) find
   #   a line for which the given block evals to true.
   #
   # options - an optional Hash of processing options:
+  #           * :terminator may be used to specify the contents of the line
+  #               at which the reader should stop
   #           * :break_on_blank_lines may be used to specify to break on
   #               blank lines
+  #           * :break_on_list_continuation may be used to specify to break
+  #               on a list continuation line
   #           * :skip_first_line may be used to tell the reader to advance
   #               beyond the first line before beginning the scan
   #           * :preserve_last_line may be used to specify that the String
@@ -405,6 +413,10 @@ class Reader
   #           * :read_last_line may be used to specify that the String
   #               causing the method to stop processing lines should be
   #               included in the lines being returned
+  #           * :skip_line_comments may be used to look for and skip
+  #               line comments
+  #           * :skip_processing is used to disable line (pre)processing
+  #               for the duration of this method
   #
   # Returns the Array of lines forming the next segment.
   #
@@ -422,26 +434,21 @@ class Reader
   #   => ["First line", "Second line"]
   def read_lines_until options = {}
     result = []
-    advance if options[:skip_first_line]
     if @process_lines && options[:skip_processing]
       @process_lines = false
       restore_process_lines = true
-    else
-      restore_process_lines = false
     end
-
     if (terminator = options[:terminator])
+      start_cursor = options[:cursor] || cursor
       break_on_blank_lines = false
       break_on_list_continuation = false
     else
       break_on_blank_lines = options[:break_on_blank_lines]
       break_on_list_continuation = options[:break_on_list_continuation]
     end
-    skip_line_comments = options[:skip_line_comments]
-    line_read = false
-    line_restored = false
-    
-    complete = false
+    skip_comments = options[:skip_line_comments]
+    complete = line_read = line_restored = nil
+    shift if options[:skip_first_line]
     while !complete && (line = read_line)
       complete = while true
         break true if terminator && line == terminator
@@ -454,27 +461,30 @@ class Reader
         break true if block_given? && (yield line)
         break false
       end
-
       if complete
         if options[:read_last_line]
           result << line
           line_read = true
         end
         if options[:preserve_last_line]
-          restore_line line
+          unshift line
           line_restored = true
         end
       else
-        unless skip_line_comments && line.start_with?('//') && CommentLineRx =~ line
+        unless skip_comments && (line.start_with? '//') && !(line.start_with? '///')
           result << line
           line_read = true
         end
       end
     end
-
     if restore_process_lines
       @process_lines = true
       @look_ahead -= 1 if line_restored && !terminator
+    end
+    if terminator && terminator != line && (context = options.fetch :context, terminator)
+      start_cursor = cursor_at_mark if start_cursor == :at_mark
+      logger.warn message_with_context %(unterminated #{context} block), :source_location => start_cursor
+      @unterminated = true
     end
     result
   end
@@ -483,6 +493,7 @@ class Reader
   #
   # This method can be used directly when you've already called peek_line
   # and determined that you do, in fact, want to pluck that line off the stack.
+  # Use read_line if the line hasn't (or many not have been) visited yet.
   #
   # Returns The String line at the top of the stack
   def shift
@@ -495,12 +506,43 @@ class Reader
   def unshift line
     @lineno -= 1
     @look_ahead += 1
-    @eof = false
     @lines.unshift line
+  end
+
+  # Internal: Restore the lines to the stack and decrement the lineno
+  def unshift_all lines
+    @lineno -= lines.size
+    @look_ahead += lines.size
+    @lines.unshift(*lines)
   end
 
   def cursor
     Cursor.new @file, @dir, @path, @lineno
+  end
+
+  def cursor_at_line lineno
+    Cursor.new @file, @dir, @path, lineno
+  end
+
+  def cursor_at_mark
+    @mark ? Cursor.new(*@mark) : cursor
+  end
+
+  def cursor_before_mark
+    if @mark
+      m_file, m_dir, m_path, m_lineno = @mark
+      Cursor.new m_file, m_dir, m_path, m_lineno - 1
+    else
+      Cursor.new @file, @dir, @path, @lineno - 1
+    end
+  end
+
+  def cursor_at_prev_line
+    Cursor.new @file, @dir, @path, @lineno - 1
+  end
+
+  def mark
+    @mark = @file, @dir, @path, @lineno
   end
 
   # Public: Get information about the last line read, including file name and line number.
@@ -509,54 +551,46 @@ class Reader
   def line_info
     %(#{@path}: line #{@lineno})
   end
-  alias :next_line_info :line_info
-
-  def prev_line_info
-    %(#{@path}: line #{@lineno - 1})
-  end
 
   # Public: Get a copy of the remaining Array of String lines managed by this Reader
   #
   # Returns A copy of the String Array of lines remaining in this Reader
   def lines
-    @lines.dup
+    @lines.drop 0
   end
 
   # Public: Get a copy of the remaining lines managed by this Reader joined as a String
   def string
-    @lines * EOL
+    @lines.join LF
   end
 
   # Public: Get the source lines for this Reader joined as a String
   def source
-    @source_lines * EOL
+    @source_lines.join LF
   end
 
   # Public: Get a summary of this Reader.
   #
   #
   # Returns A string summary of this reader, which contains the path and line information
-  def to_s
-    line_info
-  end
+  alias to_s line_info
 end
 
 # Public: Methods for retrieving lines from AsciiDoc source files, evaluating preprocessor
 # directives as each line is read off the Array of lines.
 class PreprocessorReader < Reader
   attr_reader :include_stack
-  attr_reader :includes
 
   # Public: Initialize the PreprocessorReader object
-  def initialize document, data = nil, cursor = nil
+  def initialize document, data = nil, cursor = nil, opts = {}
     @document = document
-    super data, cursor, :normalize => true
+    super data, cursor, opts
     include_depth_default = document.attributes.fetch('max-include-depth', 64).to_i
     include_depth_default = 0 if include_depth_default < 0
     # track both absolute depth for comparing to size of include stack and relative depth for reporting
     @maxdepth = {:abs => include_depth_default, :rel => include_depth_default}
     @include_stack = []
-    @includes = (document.references[:includes] ||= [])
+    @includes = document.catalog[:includes]
     @skipping = false
     @conditional_stack = []
     @include_processor_extensions = nil
@@ -566,9 +600,9 @@ class PreprocessorReader < Reader
     result = super
 
     # QUESTION should this work for AsciiDoc table cell content? Currently it does not.
-    if @document && (@document.attributes.has_key? 'skip-front-matter')
+    if @document && @document.attributes['skip-front-matter']
       if (front_matter = skip_front_matter! result)
-        @document.attributes['front-matter'] = front_matter * EOL
+        @document.attributes['front-matter'] = front_matter.join LF
       end
     end
 
@@ -577,8 +611,8 @@ class PreprocessorReader < Reader
       result.pop while (last = result[-1]) && last.empty?
     end
 
-    if (indent = opts.fetch(:indent, nil))
-      Parser.reset_block_indent! result, indent.to_i
+    if opts[:indent]
+      Parser.adjust_indentation! result, opts[:indent], (@document.attr 'tabsize')
     end
 
     result
@@ -589,50 +623,46 @@ class PreprocessorReader < Reader
 
     if line.empty?
       @look_ahead += 1
-      return ''
+      return line
     end
 
     # NOTE highly optimized
     if line.end_with?(']') && !line.start_with?('[') && line.include?('::')
-      if line.include?('if') && (match = ConditionalDirectiveRx.match(line))
+      if (line.include? 'if') && ConditionalDirectiveRx =~ line
         # if escaped, mark as processed and return line unescaped
-        if line.start_with?('\\')
+        if $1 == '\\'
           @unescape_next_line = true
           @look_ahead += 1
           line[1..-1]
+        elsif preprocess_conditional_directive $2, $3, $4, $5
+          # move the pointer past the conditional line
+          shift
+          # treat next line as uncharted territory
+          nil
         else
-          if preprocess_conditional_inclusion(*match.captures)
-            # move the pointer past the conditional line
-            advance
-            # treat next line as uncharted territory
-            nil
-          else
-            # the line was not a valid conditional line
-            # mark it as visited and return it
-            @look_ahead += 1
-            line
-          end
+          # the line was not a valid conditional line
+          # mark it as visited and return it
+          @look_ahead += 1
+          line
         end
       elsif @skipping
-        advance
+        shift
         nil
-      elsif ((escaped = line.start_with?('\\include::')) || line.start_with?('include::')) && (match = IncludeDirectiveRx.match(line))
+      elsif (line.start_with? 'inc', '\\inc') && IncludeDirectiveRx =~ line
         # if escaped, mark as processed and return line unescaped
-        if escaped
+        if $1 == '\\'
           @unescape_next_line = true
           @look_ahead += 1
           line[1..-1]
+        # QUESTION should we strip whitespace from raw attributes in Substitutors#parse_attributes? (check perf)
+        elsif preprocess_include_directive $2, $3
+          # peek again since the content has changed
+          nil
         else
-          # QUESTION should we strip whitespace from raw attributes in Substitutors#parse_attributes? (check perf)
-          if preprocess_include match[1], match[2].strip
-            # peek again since the content has changed
-            nil
-          else
-            # the line was not a valid include line and is unchanged
-            # mark it as visited and return it
-            @look_ahead += 1
-            line
-          end
+          # the line was not a valid include line and is unchanged
+          # mark it as visited and return it
+          @look_ahead += 1
+          line
         end
       else
         # NOTE optimization to inline super
@@ -640,7 +670,7 @@ class PreprocessorReader < Reader
         line
       end
     elsif @skipping
-      advance
+      shift
       nil
     else
       # NOTE optimization to inline super
@@ -649,13 +679,24 @@ class PreprocessorReader < Reader
     end
   end
 
+  # (see Reader#has_more_lines?)
+  def has_more_lines?
+    peek_line ? true : false
+  end
+
+  # (see Reader#empty?)
+  def empty?
+    peek_line ? false : true
+  end
+  alias eof? empty?
+
   # Public: Override the Reader#peek_line method to pop the include
   # stack if the last line has been reached and there's at least
   # one include on the stack.
   #
   # Returns the next line of the source data as a String if there are lines remaining
   # in the current include context or a parent include context.
-  # Returns nil if there are no more lines remaining and the include stack is empty.
+  # Returns nothing if there are no more lines remaining and the include stack is empty.
   def peek_line direct = false
     if (line = super)
       line
@@ -667,119 +708,116 @@ class PreprocessorReader < Reader
     end
   end
 
-  # Internal: Preprocess the directive (macro) to conditionally include content.
+  # Internal: Preprocess the directive to conditionally include or exclude content.
   #
-  # Preprocess the conditional inclusion directive (ifdef, ifndef, ifeval,
-  # endif) under the cursor. If the Reader is currently skipping content, then
-  # simply track the open and close delimiters of any nested conditional
-  # blocks. If the Reader is not skipping, mark whether the condition is
-  # satisfied and continue preprocessing recursively until the next line of
-  # available content is found.
+  # Preprocess the conditional directive (ifdef, ifndef, ifeval, endif) under
+  # the cursor. If Reader is currently skipping content, then simply track the
+  # open and close delimiters of any nested conditional blocks. If Reader is
+  # not skipping, mark whether the condition is satisfied and continue
+  # preprocessing recursively until the next line of available content is
+  # found.
   #
-  # directive  - The conditional inclusion directive (ifdef, ifndef, ifeval, endif)
-  # target     - The target, which is the name of one or more attributes that are
-  #              used in the condition (blank in the case of the ifeval directive)
-  # delimiter  - The conditional delimiter for multiple attributes ('+' means all
-  #              attributes must be defined or undefined, ',' means any of the attributes
-  #              can be defined or undefined.
-  # text       - The text associated with this directive (occurring between the square brackets)
-  #              Used for a single-line conditional block in the case of the ifdef or
-  #              ifndef directives, and for the conditional expression for the ifeval directive.
+  # keyword   - The conditional inclusion directive (ifdef, ifndef, ifeval, endif)
+  # target    - The target, which is the name of one or more attributes that are
+  #             used in the condition (blank in the case of the ifeval directive)
+  # delimiter - The conditional delimiter for multiple attributes ('+' means all
+  #             attributes must be defined or undefined, ',' means any of the attributes
+  #             can be defined or undefined.
+  # text      - The text associated with this directive (occurring between the square brackets)
+  #             Used for a single-line conditional block in the case of the ifdef or
+  #             ifndef directives, and for the conditional expression for the ifeval directive.
   #
-  # returns a Boolean indicating whether the cursor should be advanced
-  def preprocess_conditional_inclusion directive, target, delimiter, text
+  # Returns a Boolean indicating whether the cursor should be advanced
+  def preprocess_conditional_directive keyword, target, delimiter, text
+    # attributes are case insensitive
+    target = target.downcase unless (no_target = target.empty?)
+
     # must have a target before brackets if ifdef or ifndef
     # must not have text between brackets if endif
-    # don't honor match if it doesn't meet this criteria
+    # skip line if it doesn't meet this criteria
     # QUESTION should we warn for these bogus declarations?
-    if ((directive == 'ifdef' || directive == 'ifndef') && target.empty?) ||
-        (directive == 'endif' && text)
-      return false
-    end
+    return false if (no_target && (keyword == 'ifdef' || keyword == 'ifndef')) || (text && keyword == 'endif')
 
-    # attributes are case insensitive
-    target = target.downcase
-
-    if directive == 'endif'
-      stack_size = @conditional_stack.size
-      if stack_size > 0
-        pair = @conditional_stack[-1]
-        if target.empty? || target == pair[:target]
-          @conditional_stack.pop
-          @skipping = @conditional_stack.empty? ? false : @conditional_stack[-1][:skipping]
-        else
-          warn "asciidoctor: ERROR: #{line_info}: mismatched macro: endif::#{target}[], expected endif::#{pair[:target]}[]"
-        end
+    if keyword == 'endif'
+      if @conditional_stack.empty?
+        logger.error message_with_context %(unmatched macro: endif::#{target}[]), :source_location => cursor
+      elsif no_target || target == (pair = @conditional_stack[-1])[:target]
+        @conditional_stack.pop
+        @skipping = @conditional_stack.empty? ? false : @conditional_stack[-1][:skipping]
       else
-        warn "asciidoctor: ERROR: #{line_info}: unmatched macro: endif::#{target}[]"
+        logger.error message_with_context %(mismatched macro: endif::#{target}[], expected endif::#{pair[:target]}[]), :source_location => cursor
       end
       return true
     end
 
-    skip = false
-    unless @skipping
+    if @skipping
+      skip = false
+    else
       # QUESTION any way to wrap ifdef & ifndef logic up together?
-      case directive
+      case keyword
       when 'ifdef'
         case delimiter
-        when nil
-          # if the attribute is undefined, then skip
-          skip = !@document.attributes.has_key?(target)
         when ','
-          # if any attribute is defined, then don't skip
-          skip = !target.split(',').detect {|name| @document.attributes.has_key? name }
+          # skip if no attribute is defined
+          skip = target.split(',', -1).none? {|name| @document.attributes.key? name }
         when '+'
-          # if any attribute is undefined, then skip
-          skip = target.split('+').detect {|name| !@document.attributes.has_key? name }
+          # skip if any attribute is undefined
+          skip = target.split('+', -1).any? {|name| !@document.attributes.key? name }
+        else
+          # if the attribute is undefined, then skip
+          skip = !@document.attributes.key?(target)
         end
       when 'ifndef'
         case delimiter
-        when nil
-          # if the attribute is defined, then skip
-          skip = @document.attributes.has_key?(target)
         when ','
-          # if any attribute is undefined, then don't skip
-          skip = !target.split(',').detect {|name| !@document.attributes.has_key? name }
+          # skip if any attribute is defined
+          skip = target.split(',', -1).any? {|name| @document.attributes.key? name }
         when '+'
-          # if any attribute is defined, then skip
-          skip = target.split('+').detect {|name| @document.attributes.has_key? name }
+          # skip if all attributes are defined
+          skip = target.split('+', -1).all? {|name| @document.attributes.key? name }
+        else
+          # if the attribute is defined, then skip
+          skip = @document.attributes.key?(target)
         end
       when 'ifeval'
         # the text in brackets must match an expression
         # don't honor match if it doesn't meet this criteria
-        if !target.empty? || !(expr_match = EvalExpressionRx.match(text.strip))
-          return false
+        return false unless no_target && EvalExpressionRx =~ text.strip
+
+        # NOTE save values eagerly for Ruby 1.8.7 compat
+        lhs, op, rhs = $1, $2, $3
+        lhs = resolve_expr_val lhs
+        rhs = resolve_expr_val rhs
+
+        # regex enforces a restricted set of math-related operations
+        if op == '!='
+          skip = lhs.send :==, rhs
+        else
+          skip = !(lhs.send op.to_sym, rhs)
         end
-
-        lhs = resolve_expr_val expr_match[1]
-        # regex enforces a restrict set of math-related operations
-        op = expr_match[2]
-        rhs = resolve_expr_val expr_match[3]
-
-        skip = !(lhs.send op.to_sym, rhs)
       end
     end
 
     # conditional inclusion block
-    if directive == 'ifeval' || !text
+    if keyword == 'ifeval' || !text
       @skipping = true if skip
       @conditional_stack << {:target => target, :skip => skip, :skipping => @skipping}
     # single line conditional inclusion
     else
       unless @skipping || skip
-        # FIXME slight hack to skip past conditional line
-        # but keep our synthetic line marked as processed
-        conditional_line = peek_line true
-        replace_line text.rstrip
-        unshift conditional_line
-        return true
+        replace_next_line text.rstrip
+        # HACK push dummy line to stand in for the opening conditional directive that's subsequently dropped
+        unshift ''
+        # NOTE force line to be processed again if it looks like an include directive
+        # QUESTION should we just call preprocess_include_directive here?
+        @look_ahead -= 1 if text.start_with? 'include::'
       end
     end
 
     true
   end
 
-  # Internal: Preprocess the directive (macro) to include the target document.
+  # Internal: Preprocess the directive to include lines from another document.
   #
   # Preprocess the directive to include the target document. The scenarios
   # are as follows:
@@ -796,193 +834,236 @@ class PreprocessorReader < Reader
   #
   # If none of the above apply, emit the include directive line verbatim.
   #
-  # target - The name of the source document to include as specified in the
-  #          target slot of the include::[] macro
+  # target   - The unsubstituted String name of the target document to include as specified in the
+  #            target slot of the include directive.
+  # attrlist - An attribute list String, which is the text between the square brackets of the
+  #            include directive.
   #
-  # returns a Boolean indicating whether the line under the cursor has changed.
-  def preprocess_include raw_target, raw_attributes
-    if (target = @document.sub_attributes raw_target, :attribute_missing => 'drop-line').empty?
-      if @document.attributes.fetch('attribute-missing', Compliance.attribute_missing) == 'skip'
-        replace_line %(Unresolved directive in #{@path} - include::#{raw_target}[#{raw_attributes}])
-        true
-      else
-        advance
-        true
+  # Returns a [Boolean] indicating whether the line under the cursor was changed. To skip over the
+  # directive, call shift and return true.
+  def preprocess_include_directive target, attrlist
+    if ((expanded_target = target).include? ATTR_REF_HEAD) &&
+        (expanded_target = @document.sub_attributes target, :attribute_missing => 'drop-line').empty?
+      shift
+      if (@document.attributes['attribute-missing'] || Compliance.attribute_missing) == 'skip'
+        unshift %(Unresolved directive in #{@path} - include::#{target}[#{attrlist}])
       end
-    # assume that if an include processor is given, the developer wants
-    # to handle when and how to process the include
-    elsif include_processors? &&
-        (extension = @include_processor_extensions.find {|candidate| candidate.instance.handles? target })
-      advance
-      # FIXME parse attributes if requested by extension
-      extension.process_method[@document, self, target, AttributeList.new(raw_attributes).parse]
+      true
+    elsif include_processors? && (ext = @include_processor_extensions.find {|candidate| candidate.instance.handles? expanded_target })
+      shift
+      # FIXME parse attributes only if requested by extension
+      # QUESTION should we use (@document.parse_attributes attrlist, [])?
+      parsed_attrs = attrlist ? AttributeList.new((attrlist.include? ATTR_REF_HEAD) ? (@document.sub_attributes attrlist) : attrlist).parse : {}
+      ext.process_method[@document, self, expanded_target, parsed_attrs]
       true
     # if running in SafeMode::SECURE or greater, don't process this directive
     # however, be friendly and at least make it a link to the source document
     elsif @document.safe >= SafeMode::SECURE
       # FIXME we don't want to use a link macro if we are in a verbatim context
-      replace_line %(link:#{target}[])
-      true
-    elsif (abs_maxdepth = @maxdepth[:abs]) > 0 && @include_stack.size >= abs_maxdepth
-      warn %(asciidoctor: ERROR: #{line_info}: maximum include depth of #{@maxdepth[:rel]} exceeded)
-      false
-    elsif abs_maxdepth > 0
-      if ::RUBY_ENGINE_OPAL
-        # NOTE resolves uri relative to currently loaded document
-        # NOTE we defer checking if file exists and catch the 404 error if it does not
-        # TODO only use this logic if env-browser is set
-        target_type = :file
-        include_file = path = if @include_stack.empty?
-          ::Dir.pwd == @document.base_dir ? target : (::File.join @dir, target)
-        else
-          ::File.join @dir, target
-        end
-      elsif target.include?(':') && UriSniffRx =~ target
-        unless @document.attributes.has_key? 'allow-uri-read'
-          replace_line %(link:#{target}[])
-          return true
-        end
-
-        target_type = :uri
-        include_file = path = target
-        if @document.attributes.has_key? 'cache-uri'
-          # caching requires the open-uri-cached gem to be installed
-          # processing will be automatically aborted if these libraries can't be opened
-          Helpers.require_library 'open-uri/cached', 'open-uri-cached'
-        elsif !::RUBY_ENGINE_OPAL
-          # autoload open-uri
-          ::OpenURI
-        end
-      else
-        target_type = :file
-        # include file is resolved relative to dir of current include, or base_dir if within original docfile
-        include_file = @document.normalize_system_path(target, @dir, nil, :target_name => 'include file')
-        unless ::File.file? include_file
-          warn "asciidoctor: WARNING: #{line_info}: include file not found: #{include_file}"
-          replace_line %(Unresolved directive in #{@path} - include::#{target}[#{raw_attributes}])
-          return true
-        end
-        #path = @document.relative_path include_file
-        path = PathResolver.new.relative_path include_file, @document.base_dir
+      replace_next_line %(link:#{expanded_target}[])
+    elsif (abs_maxdepth = @maxdepth[:abs]) > 0
+      if @include_stack.size >= abs_maxdepth
+        logger.error message_with_context %(maximum include depth of #{@maxdepth[:rel]} exceeded), :source_location => cursor
+        return
       end
 
-      inc_lines = nil
-      tags = nil
-      attributes = {}
-      if !raw_attributes.empty?
-        # QUESTION should we use @document.parse_attribues?
-        attributes = AttributeList.new(raw_attributes).parse
-        if attributes.has_key? 'lines'
-          inc_lines = []
-          attributes['lines'].split(DataDelimiterRx).each do |linedef|
+      # QUESTION should we use (@document.parse_attributes attrlist, [])?
+      parsed_attrs = attrlist ? AttributeList.new((attrlist.include? ATTR_REF_HEAD) ? (@document.sub_attributes attrlist) : attrlist).parse : {}
+      inc_path, target_type, relpath = resolve_include_path expanded_target, attrlist, parsed_attrs
+      return inc_path unless target_type
+
+      inc_linenos = inc_tags = nil
+      if attrlist
+        if parsed_attrs.key? 'lines'
+          inc_linenos = []
+          parsed_attrs['lines'].split(DataDelimiterRx).each do |linedef|
             if linedef.include?('..')
-              from, to = linedef.split('..').map(&:to_i)
-              if to == -1
-                inc_lines << from
-                inc_lines << 1.0/0.0
-              else
-                inc_lines.concat ::Range.new(from, to).to_a
-              end
+              from, to = linedef.split('..', 2).map {|it| it.to_i }
+              inc_linenos += to < 0 ? [from, 1.0/0.0] : ::Range.new(from, to).to_a
             else
-              inc_lines << linedef.to_i
+              inc_linenos << linedef.to_i
             end
           end
-          inc_lines = inc_lines.sort.uniq
-        elsif attributes.has_key? 'tag'
-          tags = [attributes['tag']].to_set
-        elsif attributes.has_key? 'tags'
-          tags = attributes['tags'].split(DataDelimiterRx).uniq.to_set
+          inc_linenos = inc_linenos.empty? ? nil : inc_linenos.sort.uniq
+        elsif parsed_attrs.key? 'tag'
+          unless (tag = parsed_attrs['tag']).empty? || tag == '!'
+            inc_tags = (tag.start_with? '!') ? { (tag.slice 1, tag.length) => false } : { tag => true }
+          end
+        elsif parsed_attrs.key? 'tags'
+          inc_tags = {}
+          parsed_attrs['tags'].split(DataDelimiterRx).each do |tagdef|
+            if tagdef.start_with? '!'
+              inc_tags[tagdef.slice 1, tagdef.length] = false
+            else
+              inc_tags[tagdef] = true
+            end unless tagdef.empty? || tagdef == '!'
+          end
+          inc_tags = nil if inc_tags.empty?
         end
       end
-      if !inc_lines.nil?
-        if !inc_lines.empty?
-          selected = []
-          inc_line_offset = 0
-          inc_lineno = 0
-          begin
-            open(include_file, 'r') do |f|
-              f.each_line do |l|
-                inc_lineno += 1
-                take = inc_lines[0]
-                if take.is_a?(::Float) && take.infinite?
-                  selected.push l
-                  inc_line_offset = inc_lineno if inc_line_offset == 0
-                else
-                  if f.lineno == take
-                    selected.push l
-                    inc_line_offset = inc_lineno if inc_line_offset == 0
-                    inc_lines.shift
-                  end
-                  break if inc_lines.empty?
+
+      if inc_linenos
+        inc_lines, inc_offset, inc_lineno = [], nil, 0
+        begin
+          open(inc_path, 'rb') do |f|
+            select_remaining = nil
+            f.each_line do |l|
+              inc_lineno += 1
+              if select_remaining || (::Float === (select = inc_linenos[0]) && (select_remaining = select.infinite?))
+                # NOTE record line where we started selecting
+                inc_offset ||= inc_lineno
+                inc_lines << l
+              else
+                if select == inc_lineno
+                  # NOTE record line where we started selecting
+                  inc_offset ||= inc_lineno
+                  inc_lines << l
+                  inc_linenos.shift
                 end
+                break if inc_linenos.empty?
               end
             end
-          rescue
-            warn %(asciidoctor: WARNING: #{line_info}: include #{target_type} not readable: #{include_file})
-            replace_line %(Unresolved directive in #{@path} - include::#{target}[#{raw_attributes}])
-            return true
           end
-          advance
-          # FIXME not accounting for skipped lines in reader line numbering
-          push_include selected, include_file, path, inc_line_offset, attributes
+        rescue
+          logger.error message_with_context %(include #{target_type} not readable: #{inc_path}), :source_location => cursor
+          return replace_next_line %(Unresolved directive in #{@path} - include::#{expanded_target}[#{attrlist}])
         end
-      elsif !tags.nil?
-        if !tags.empty?
-          selected = []
-          inc_line_offset = 0
-          inc_lineno = 0
-          active_tag = nil
-          tags_found = ::Set.new
-          begin
-            open(include_file, 'r') do |f|
-              f.each_line do |l|
-                inc_lineno += 1
-                # must force encoding here since we're performing String operations on line
-                l.force_encoding(::Encoding::UTF_8) if FORCE_ENCODING
-                l = l.rstrip
-                if active_tag
-                  if l.end_with?(%(end::#{active_tag}[])) && TagDirectiveRx =~ l
-                    active_tag = nil
-                  else
-                    selected.push l unless l.end_with?('[]') && TagDirectiveRx =~ l
-                    inc_line_offset = inc_lineno if inc_line_offset == 0
-                  end
-                else
-                  tags.each do |tag|
-                    if l.end_with?(%(tag::#{tag}[])) && TagDirectiveRx =~ l
-                      active_tag = tag
-                      tags_found << tag
-                      break
+        shift
+        # FIXME not accounting for skipped lines in reader line numbering
+        if inc_offset
+          parsed_attrs['partial-option'] = true
+          push_include inc_lines, inc_path, relpath, inc_offset, parsed_attrs
+        end
+      elsif inc_tags
+        inc_lines, inc_offset, inc_lineno, tag_stack, tags_used, active_tag = [], nil, 0, [], ::Set.new, nil
+        if inc_tags.key? '**'
+          if inc_tags.key? '*'
+            select = base_select = (inc_tags.delete '**')
+            wildcard = inc_tags.delete '*'
+          else
+            select = base_select = wildcard = (inc_tags.delete '**')
+          end
+        else
+          select = base_select = !(inc_tags.value? true)
+          wildcard = inc_tags.delete '*'
+        end
+        begin
+          open(inc_path, 'rb') do |f|
+            dbl_co, dbl_sb = '::', '[]'
+            encoding = ::Encoding::UTF_8 if COERCE_ENCODING
+            f.each_line do |l|
+              inc_lineno += 1
+              # must force encoding since we're performing String operations on line
+              l.force_encoding encoding if encoding
+              if (l.include? dbl_co) && (l.include? dbl_sb) && TagDirectiveRx =~ l
+                if $1 # end tag
+                  if (this_tag = $2) == active_tag
+                    tag_stack.pop
+                    active_tag, select = tag_stack.empty? ? [nil, base_select] : tag_stack[-1]
+                  elsif inc_tags.key? this_tag
+                    include_cursor = create_include_cursor inc_path, expanded_target, inc_lineno
+                    if (idx = tag_stack.rindex {|key, _| key == this_tag })
+                      idx == 0 ? tag_stack.shift : (tag_stack.delete_at idx)
+                      logger.warn message_with_context %(mismatched end tag (expected '#{active_tag}' but found '#{this_tag}') at line #{inc_lineno} of include #{target_type}: #{inc_path}), :source_location => cursor, :include_location => include_cursor
+                    else
+                      logger.warn message_with_context %(unexpected end tag '#{this_tag}' at line #{inc_lineno} of include #{target_type}: #{inc_path}), :source_location => cursor, :include_location => include_cursor
                     end
                   end
+                elsif inc_tags.key?(this_tag = $2)
+                  tags_used << this_tag
+                  # QUESTION should we prevent tag from being selected when enclosing tag is excluded?
+                  tag_stack << [(active_tag = this_tag), (select = inc_tags[this_tag]), inc_lineno]
+                elsif !wildcard.nil?
+                  select = active_tag && !select ? false : wildcard
+                  tag_stack << [(active_tag = this_tag), select, inc_lineno]
                 end
+              elsif select
+                # NOTE record the line where we started selecting
+                inc_offset ||= inc_lineno
+                inc_lines << l
               end
             end
-          rescue
-            warn %(asciidoctor: WARNING: #{line_info}: include #{target_type} not readable: #{include_file})
-            replace_line %(Unresolved directive in #{@path} - include::#{target}[#{raw_attributes}])
-            return true
           end
-          unless (missing_tags = tags.to_a - tags_found.to_a).empty?
-            warn "asciidoctor: WARNING: #{line_info}: tag#{missing_tags.size > 1 ? 's' : nil} '#{missing_tags * ','}' not found in include #{target_type}: #{include_file}"
+        rescue
+          logger.error message_with_context %(include #{target_type} not readable: #{inc_path}), :source_location => cursor
+          return replace_next_line %(Unresolved directive in #{@path} - include::#{expanded_target}[#{attrlist}])
+        end
+        unless tag_stack.empty?
+          tag_stack.each do |tag_name, _, tag_lineno|
+            logger.warn message_with_context %(detected unclosed tag '#{tag_name}' starting at line #{tag_lineno} of include #{target_type}: #{inc_path}), :source_location => cursor, :include_location => (create_include_cursor inc_path, expanded_target, tag_lineno)
           end
-          advance
+        end
+        unless (missing_tags = inc_tags.keys.to_a - tags_used.to_a).empty?
+          logger.warn message_with_context %(tag#{missing_tags.size > 1 ? 's' : ''} '#{missing_tags.join ', '}' not found in include #{target_type}: #{inc_path}), :source_location => cursor
+        end
+        shift
+        if inc_offset
+          parsed_attrs['partial-option'] = true unless base_select && wildcard && inc_tags.empty?
           # FIXME not accounting for skipped lines in reader line numbering
-          push_include selected, include_file, path, inc_line_offset, attributes
+          push_include inc_lines, inc_path, relpath, inc_offset, parsed_attrs
         end
       else
         begin
-          advance
-          push_include open(include_file, 'r') {|f| f.read }, include_file, path, 1, attributes
+          # NOTE read content first so that we only advance cursor if IO operation succeeds
+          inc_content = target_type == :file ? ::File.open(inc_path, 'rb') {|f| f.read } : open(inc_path, 'rb') {|f| f.read }
+          shift
+          push_include inc_content, inc_path, relpath, 1, parsed_attrs
         rescue
-          warn %(asciidoctor: WARNING: #{line_info}: include #{target_type} not readable: #{include_file})
-          replace_line %(Unresolved directive in #{@path} - include::#{target}[#{raw_attributes}])
-          return true
+          logger.error message_with_context %(include #{target_type} not readable: #{inc_path}), :source_location => cursor
+          return replace_next_line %(Unresolved directive in #{@path} - include::#{expanded_target}[#{attrlist}])
         end
       end
       true
+    end
+  end
+
+  # Internal: Resolve the target of an include directive.
+  #
+  # An internal method to resolve the target of an include directive. This method must return an
+  # Array containing the resolved (absolute) path of the target, the target type (:file or :uri),
+  # and the path of the target relative to the outermost document. Alternately, the method may
+  # return a boolean to halt processing of the include directive line and to indicate whether the
+  # cursor should be advanced beyond this line (true) or the line should be reprocessed (false).
+  #
+  # This method is overridden in Asciidoctor.js to resolve the target of an include in the browser
+  # environment.
+  #
+  # target     - A String containing the unresolved include target.
+  #              (Attribute references in target value have already been resolved).
+  # attrlist   - An attribute list String (i.e., the text between the square brackets).
+  # attributes - A Hash of attributes parsed from attrlist.
+  #
+  # Returns An Array containing the resolved (absolute) include path, the target type, and the path
+  # relative to the outermost document. May also return a boolean to halt processing of the include.
+  def resolve_include_path target, attrlist, attributes
+    doc = @document
+    if (Helpers.uriish? target) || (::String === @dir ? nil : (target = %(#{@dir}/#{target})))
+      return replace_next_line %(link:#{target}[#{attrlist}]) unless doc.attr? 'allow-uri-read'
+      if doc.attr? 'cache-uri'
+        # caching requires the open-uri-cached gem to be installed
+        # processing will be automatically aborted if these libraries can't be opened
+        Helpers.require_library 'open-uri/cached', 'open-uri-cached' unless defined? ::OpenURI::Cache
+      elsif !::RUBY_ENGINE_OPAL
+        # autoload open-uri
+        ::OpenURI
+      end
+      [(::URI.parse target), :uri, target]
     else
-      false
+      # include file is resolved relative to dir of current include, or base_dir if within original docfile
+      inc_path = doc.normalize_system_path target, @dir, nil, :target_name => 'include file'
+      unless ::File.file? inc_path
+        if attributes.key? 'optional-option'
+          shift
+          return true
+        else
+          logger.error message_with_context %(include file not found: #{inc_path}), :source_location => cursor
+          return replace_next_line %(Unresolved directive in #{@path} - include::#{target}[#{attrlist}])
+        end
+      end
+      # NOTE relpath is the path relative to the root document (or base_dir, if set)
+      # QUESTION should we move relative_path method to Document
+      relpath = doc.path_resolver.relative_path inc_path, doc.base_dir
+      [inc_path, :file, relpath]
     end
   end
 
@@ -999,31 +1080,39 @@ class PreprocessorReader < Reader
   #    data = IO.read file
   #    reader.push_include data, file, path
   #
-  # Returns nothing
+  # Returns this Reader object.
   def push_include data, file = nil, path = nil, lineno = 1, attributes = {}
     @include_stack << [@lines, @file, @dir, @path, @lineno, @maxdepth, @process_lines]
-    if file
-      @file = file
-      @dir = File.dirname file
+    if (@file = file)
+      # NOTE if file is not a string, assume it's a URI
+      if ::String === file
+        @dir = ::File.dirname file
+      elsif ::RUBY_ENGINE_OPAL
+        @dir = ::URI.parse ::File.dirname(file = file.to_s)
+      else
+        # NOTE this intentionally throws an error if URI has no path
+        (@dir = file.dup).path = (dir = ::File.dirname file.path) == '/' ? '' : dir
+        file = file.to_s
+      end
+      path ||= ::File.basename file
       # only process lines in AsciiDoc files
-      @process_lines = ASCIIDOC_EXTENSIONS[::File.extname(file)]
+      @process_lines = ASCIIDOC_EXTENSIONS[::File.extname file]
     else
-      @file = nil
-      @dir = '.' # right?
+      @dir = '.'
       # we don't know what file type we have, so assume AsciiDoc
       @process_lines = true
     end
 
-    @path = if path
-      @includes << Helpers.rootname(path)
-      path
+    if path
+      @path = path
+      @includes[Helpers.rootname path] = attributes['partial-option'] ? nil : true if @process_lines
     else
-      '<stdin>'
+      @path = '<stdin>'
     end
 
     @lineno = lineno
 
-    if attributes.has_key? 'depth'
+    if attributes.key? 'depth'
       depth = attributes['depth'].to_i
       depth = 1 if depth <= 0
       @maxdepth = {:abs => (@include_stack.size - 1) + depth, :rel => depth}
@@ -1034,14 +1123,14 @@ class PreprocessorReader < Reader
       pop_include
     else
       # FIXME we eventually want to handle leveloffset without affecting the lines
-      if attributes.has_key? 'leveloffset'
+      if attributes.key? 'leveloffset'
         @lines.unshift ''
         @lines.unshift %(:leveloffset: #{attributes['leveloffset']})
-        @lines.push ''
+        @lines << ''
         if (old_leveloffset = @document.attr 'leveloffset')
-          @lines.push %(:leveloffset: #{old_leveloffset})
+          @lines << %(:leveloffset: #{old_leveloffset})
         else
-          @lines.push ':leveloffset!:'
+          @lines << ':leveloffset!:'
         end
         # compensate for these extra lines
         @lineno -= 2
@@ -1050,10 +1139,21 @@ class PreprocessorReader < Reader
       # FIXME kind of a hack
       #Document::AttributeEntry.new('infile', @file).save_to_next_block @document
       #Document::AttributeEntry.new('indir', @dir).save_to_next_block @document
-      @eof = false
       @look_ahead = 0
     end
-    nil
+    self
+  end
+
+  def create_include_cursor file, path, lineno
+    if ::String === file
+      dir = ::File.dirname file
+    elsif ::RUBY_ENGINE_OPAL
+      dir = ::File.dirname(file = file.to_s)
+    else
+      dir = (dir = ::File.dirname file.path) == '' ? '/' : dir
+      file = file.to_s
+    end
+    Cursor.new file, dir, path, lineno
   end
 
   def pop_include
@@ -1062,14 +1162,13 @@ class PreprocessorReader < Reader
       # FIXME kind of a hack
       #Document::AttributeEntry.new('infile', @file).save_to_next_block @document
       #Document::AttributeEntry.new('indir', ::File.dirname(@file)).save_to_next_block @document
-      @eof = @lines.empty?
       @look_ahead = 0
+      nil
     end
-    nil
   end
 
   def include_depth
-    @include_stack.size 
+    @include_stack.size
   end
 
   def exceeded_max_depth?
@@ -1096,12 +1195,12 @@ class PreprocessorReader < Reader
   def skip_front_matter! data, increment_linenos = true
     front_matter = nil
     if data[0] == '---'
-      original_data = data.dup
-      front_matter = []
+      original_data = data.drop 0
       data.shift
+      front_matter = []
       @lineno += 1 if increment_linenos
       while !data.empty? && data[0] != '---'
-        front_matter.push data.shift
+        front_matter << data.shift
         @lineno += 1 if increment_linenos
       end
 
@@ -1123,75 +1222,69 @@ class PreprocessorReader < Reader
   # Examples
   #
   #   expr = '"value"'
-  #   resolve_expr_val(expr)
+  #   resolve_expr_val expr
   #   # => "value"
   #
   #   expr = '"value'
-  #   resolve_expr_val(expr)
+  #   resolve_expr_val expr
   #   # => "\"value"
   #
   #   expr = '"{undefined}"'
-  #   resolve_expr_val(expr)
+  #   resolve_expr_val expr
   #   # => ""
   #
   #   expr = '{undefined}'
-  #   resolve_expr_val(expr)
+  #   resolve_expr_val expr
   #   # => nil
   #
   #   expr = '2'
-  #   resolve_expr_val(expr)
+  #   resolve_expr_val expr
   #   # => 2
   #
   #   @document.attributes['name'] = 'value'
   #   expr = '"{name}"'
-  #   resolve_expr_val(expr)
+  #   resolve_expr_val expr
   #   # => "value"
   #
   # Returns The value of the expression, coerced to the appropriate type
-  def resolve_expr_val(str)
-    val = str
-    type = nil
-
-    if val.start_with?('"') && val.end_with?('"') ||
-        val.start_with?('\'') && val.end_with?('\'')
-      type = :string
+  def resolve_expr_val val
+    if ((val.start_with? '"') && (val.end_with? '"')) ||
+        ((val.start_with? '\'') && (val.end_with? '\''))
+      quoted = true
       val = val[1...-1]
+    else
+      quoted = false
     end
 
     # QUESTION should we substitute first?
-    if val.include? '{'
-      val = @document.sub_attributes val
-    end
+    # QUESTION should we also require string to be single quoted (like block attribute values?)
+    val = @document.sub_attributes val, :attribute_missing => 'drop' if val.include? ATTR_REF_HEAD
 
-    unless type == :string
-      if val.empty?
-        val = nil
-      elsif val.strip.empty?
-        val = ' '
-      elsif val == 'true'
-        val = true
-      elsif val == 'false'
-        val = false
-      elsif val.include?('.')
-        val = val.to_f
-      else
-        # fallback to coercing to integer, since we
-        # require string values to be explicitly quoted
-        val = val.to_i
-      end
+    if quoted
+      val
+    elsif val.empty?
+      nil
+    elsif val == 'true'
+      true
+    elsif val == 'false'
+      false
+    elsif val.rstrip.empty?
+      ' '
+    elsif val.include? '.'
+      val.to_f
+    else
+      # fallback to coercing to integer, since we
+      # require string values to be explicitly quoted
+      val.to_i
     end
-
-    val
   end
 
   def include_processors?
-    if !@include_processor_extensions
+    if @include_processor_extensions.nil?
       if @document.extensions? && @document.extensions.include_processors?
-        @include_processor_extensions = @document.extensions.include_processors
-        true
+        !!(@include_processor_extensions = @document.extensions.include_processors)
       else
         @include_processor_extensions = false
-        false
       end
     else
       @include_processor_extensions != false
@@ -1199,7 +1292,7 @@ class PreprocessorReader < Reader
   end
 
   def to_s
-    %(#<#{self.class}@#{object_id} {path: #{@path.inspect}, line #: #{@lineno}, include depth: #{@include_stack.size}, include stack: [#{@include_stack.map {|inc| inc.to_s}.join ', '}]}>)
+    %(#<#{self.class}@#{object_id} {path: #{@path.inspect}, line #: #{@lineno}, include depth: #{@include_stack.size}, include stack: [#{@include_stack.map {|inc| inc.to_s }.join ', '}]}>)
   end
 end
 end

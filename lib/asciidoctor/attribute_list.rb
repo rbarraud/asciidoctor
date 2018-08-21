@@ -1,3 +1,4 @@
+# encoding: UTF-8
 module Asciidoctor
 # Public: Handles parsing AsciiDoc attribute lists into a Hash of key/value
 # pairs. By default, attributes must each be separated by a comma and quotes
@@ -21,6 +22,7 @@ module Asciidoctor
 #    => {'style' => 'quote', 'attribution' => 'Famous Person', 'citetitle' => 'Famous Book (2001)'}
 #
 class AttributeList
+  BACKSLASH = '\\'
 
   # Public: Regular expressions for detecting the boundary of a value
   BoundaryRxs = {
@@ -30,14 +32,14 @@ class AttributeList
   }
 
   # Public: Regular expressions for unescaping quoted characters
-  EscapedQuoteRxs = {
-    '"' => /\\"/,
-    '\'' => /\\'/
+  EscapedQuotes = {
+    '"' => '\\"',
+    '\'' => '\\\''
   }
 
-  # Public: A regular expression for an attribute name
+  # Public: A regular expression for an attribute name (approx. name token from XML)
   # TODO named attributes cannot contain dash characters
-  NameRx = /[A-Za-z:_][A-Za-z:_\-.]*/
+  NameRx = /#{CG_WORD}[#{CC_WORD}\-.]*/
 
   BlankRx = /[ \t]+/
 
@@ -138,7 +140,7 @@ class AttributeList
             single_quoted_value = true
           # example: foo=,
           elsif c == @delimiter
-            value = nil
+            value = ''
           # example: foo=bar (all spaces ignored)
           else
             value = %(#{c}#{scan_to_delimiter})
@@ -153,16 +155,27 @@ class AttributeList
       # opts is an alias for options
       case name
       when 'options', 'opts'
-        name = 'options'
-        value.split(',').each {|o| @attributes[%(#{o.strip}-option)] = '' }
-        @attributes[name] = value
-      when 'title'
-        @attributes[name] = value
+        if value.include? ','
+          value = value.delete ' ' if value.include? ' '
+          (value.split ',').each {|opt| @attributes[%(#{opt}-option)] = '' unless opt.empty? }
+        else
+          @attributes[%(#{value = value.strip}-option)] = ''
+        end
+        @attributes['options'] = value
       else
-        @attributes[name] = single_quoted_value && !value.empty? && @block ? (@block.apply_normal_subs value) : value
+        if single_quoted_value && @block
+          case name
+          when 'title', 'reftext'
+            @attributes[name] = value
+          else
+            @attributes[name] = @block.apply_subs value
+          end
+        else
+          @attributes[name] = value
+        end
       end
     else
-      resolved_name = single_quoted_value && !name.empty? && @block ? (@block.apply_normal_subs name) : name
+      resolved_name = single_quoted_value && @block ? (@block.apply_subs name) : name
       if (pos_name = pos_attrs[index])
         @attributes[pos_name] = resolved_name
       end
@@ -184,7 +197,11 @@ class AttributeList
 
     if (value = scan_to_quote quote)
       @scanner.get_byte
-      value.gsub EscapedQuoteRxs[quote], quote
+      if value.include? BACKSLASH
+        value.gsub EscapedQuotes[quote], quote
+      else
+        value
+      end
     else
       %(#{quote}#{scan_to_delimiter})
     end

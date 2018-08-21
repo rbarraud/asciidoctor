@@ -1,3 +1,4 @@
+# encoding: UTF-8
 module Asciidoctor
 # Public: Methods for managing sections of AsciiDoc content in a document.
 # The section responds as an Array of content blocks by delegating
@@ -23,96 +24,54 @@ class Section < AbstractBlock
   # Public: Get/Set the 0-based index order of this section within the parent block
   attr_accessor :index
 
-  # Public: Get/Set the number of this section within the parent block
-  # Only relevant if the attribute numbered is true
-  attr_accessor :number
-
   # Public: Get/Set the section name of this section
   attr_accessor :sectname
 
   # Public: Get/Set the flag to indicate whether this is a special section or a child of one
   attr_accessor :special
 
-  # Public: Get the state of the numbered attribute at this section (need to preserve for creating TOC)
+  # Public: Get/Set the flag to indicate whether this section should be numbered.
+  # The sectnum method should only be called if this flag is true.
   attr_accessor :numbered
+
+  # Public: Get the caption for this section (only relevant for appendices)
+  attr_reader :caption
 
   # Public: Initialize an Asciidoctor::Section object.
   #
-  # parent - The parent Asciidoc Object.
-  def initialize parent = nil, level = nil, numbered = true, opts = {}
+  # parent   - The parent AbstractBlock. If set, must be a Document or Section object (default: nil)
+  # level    - The Integer level of this section (default: 1 more than parent level or 1 if parent not defined)
+  # numbered - A Boolean indicating whether numbering is enabled for this Section (default: false)
+  # opts     - An optional Hash of options (default: {})
+  def initialize parent = nil, level = nil, numbered = false, opts = {}
     super parent, :section, opts
-    if level.nil?
-      if parent
-        @level = parent.level + 1
-      elsif @level.nil?
-        @level = 1
-      end
+    if Section === parent
+      @level, @special = level || (parent.level + 1), parent.special
     else
-      @level = level
+      @level, @special = level || 1, false
     end
-    @numbered = numbered && @level > 0
-    @special = parent && parent.context == :section && parent.special
+    @numbered = numbered
     @index = 0
-    @number = 1
   end
 
   # Public: The name of this section, an alias of the section title
-  alias :name :title
+  alias name title
 
-  # Public: Generate a String id for this section.
+  # Public: Generate a String ID from the title of this section.
   #
-  # The generated id is prefixed with value of the 'idprefix' attribute, which
-  # is an underscore by default.
-  #
-  # Section id synthesis can be disabled by undefining the 'sectids' attribute.
-  #
-  # If the generated id is already in use in the document, a count is appended
-  # until a unique id is found.
-  #
-  # Examples
-  #
-  #   section = Section.new(parent)
-  #   section.title = "Foo"
-  #   section.generate_id
-  #   => "_foo"
-  #
-  #   another_section = Section.new(parent)
-  #   another_section.title = "Foo"
-  #   another_section.generate_id
-  #   => "_foo_1"
-  #
-  #   yet_another_section = Section.new(parent)
-  #   yet_another_section.title = "Ben & Jerry"
-  #   yet_another_section.generate_id
-  #   => "_ben_jerry"
+  # See Section.generate_id for details.
   def generate_id
-    if @document.attributes.has_key? 'sectids'
-      sep = @document.attributes['idseparator'] || '_'
-      pre = @document.attributes['idprefix'] || '_'
-      base_id = %(#{pre}#{title.downcase.gsub(InvalidSectionIdCharsRx, sep).tr_s(sep, sep).chomp(sep)})
-      # ensure id doesn't begin with idprefix if requested it doesn't
-      if pre.empty? && base_id.start_with?(sep)
-        base_id = base_id[1..-1]
-        base_id = base_id[1..-1] while base_id.start_with?(sep)
-      end
-      gen_id = base_id
-      cnt = 2
-      while @document.references[:ids].has_key? gen_id
-        gen_id = "#{base_id}#{sep}#{cnt}"
-        cnt += 1
-      end 
-      gen_id
-    else
-      nil
-    end
+    Section.generate_id title, @document
   end
 
   # Public: Get the section number for the current Section
   #
-  # The section number is a unique, dot separated String
-  # where each entry represents one level of nesting and
-  # the value of each entry is the 1-based outline number
-  # of the Section amongst its numbered sibling Sections
+  # The section number is a dot-separated String that uniquely describes the position of this
+  # Section in the document. Each entry represents a level of nesting. The value of each entry is
+  # the 1-based outline number of the Section amongst its numbered sibling Sections.
+  #
+  # This method assumes that both the @level and @parent instance variables have been assigned.
+  # The method also assumes that the value of @parent is either a Document or Section.
   #
   # delimiter - the delimiter to separate the number for each level
   # append    - the String to append at the end of the section number
@@ -152,10 +111,47 @@ class Section < AbstractBlock
   # Returns the section number as a String
   def sectnum(delimiter = '.', append = nil)
     append ||= (append == false ? '' : delimiter)
-    if @level && @level > 1 && @parent && @parent.context == :section
-      "#{@parent.sectnum(delimiter)}#{@number}#{append}"
+    if @level == 1
+      %(#{@number}#{append})
+    elsif @level > 1
+      Section === @parent ? %(#{@parent.sectnum(delimiter)}#{@number}#{append}) : %(#{@number}#{append})
+    else # @level == 0
+      %(#{Helpers.int_to_roman @number}#{append})
+    end
+  end
+
+  # (see AbstractBlock#xreftext)
+  def xreftext xrefstyle = nil
+    if (val = reftext) && !val.empty?
+      val
+    elsif xrefstyle
+      if @numbered
+        case xrefstyle
+        when 'full'
+          if (type = @sectname) == 'chapter' || type == 'appendix'
+            quoted_title = sprintf sub_quotes('_%s_'), title
+          else
+            quoted_title = sprintf sub_quotes(@document.compat_mode ? %q(``%s'') : '"`%s`"'), title
+          end
+          if (signifier = @document.attributes[%(#{type}-refsig)])
+            %(#{signifier} #{sectnum '.', ','} #{quoted_title})
+          else
+            %(#{sectnum '.', ','} #{quoted_title})
+          end
+        when 'short'
+          if (signifier = @document.attributes[%(#{@sectname}-refsig)])
+            %(#{signifier} #{sectnum '.', ''})
+          else
+            sectnum '.', ''
+          end
+        else # 'basic'
+          (type = @sectname) == 'chapter' || type == 'appendix' ? (sprintf sub_quotes('_%s_'), title) : title
+        end
+      else # apply basic styling
+        (type = @sectname) == 'chapter' || type == 'appendix' ? (sprintf sub_quotes('_%s_'), title) : title
+      end
     else
-      "#{@number}#{append}"
+      title
     end
   end
 
@@ -165,20 +161,65 @@ class Section < AbstractBlock
   #
   # block - The child Block to append to this parent Block
   #
-  # Returns nothing.
+  # Returns The parent Block
   def << block
+    assign_numeral block if block.context == :section
     super
-    if block.context == :section
-      assign_index block
-    end
   end
 
   def to_s
-    if @title != nil
-      qualified_title = @numbered ? %(#{sectnum} #{@title}) : @title
-      %(#<#{self.class}@#{object_id} {level: #{@level}, title: #{qualified_title.inspect}, blocks: #{@blocks.size}}>)
+    if @title
+      formal_title = @numbered ? %(#{sectnum} #{@title}) : @title
+      %(#<#{self.class}@#{object_id} {level: #{@level}, title: #{formal_title.inspect}, blocks: #{@blocks.size}}>)
     else
       super
+    end
+  end
+
+  # Public: Generate a String ID from the given section title.
+  #
+  # The generated ID is prefixed with value of the 'idprefix' attribute, which
+  # is an underscore (_) by default. Invalid characters are then removed and
+  # spaces are replaced with the value of the 'idseparator' attribute, which is
+  # an underscore (_) by default.
+  #
+  # If the generated ID is already in use in the document, a count is appended,
+  # offset by the separator, until a unique ID is found.
+  #
+  # Section ID generation can be disabled by unsetting the 'sectids' document attribute.
+  #
+  # Examples
+  #
+  #   Section.generate_id 'Foo', document
+  #   => "_foo"
+  #
+  # Returns the generated [String] ID.
+  def self.generate_id title, document
+    attrs = document.attributes
+    pre = attrs['idprefix'] || '_'
+    if (sep = attrs['idseparator'])
+      if sep.length == 1 || (!(no_sep = sep.empty?) && (sep = attrs['idseparator'] = sep.chr))
+        sep_sub = sep == '-' || sep == '.' ? ' .-' : %( #{sep}.-)
+      end
+    else
+      sep, sep_sub = '_', ' _.-'
+    end
+    gen_id = %(#{pre}#{title.downcase.gsub InvalidSectionIdCharsRx, ''})
+    if no_sep
+      gen_id = gen_id.delete ' '
+    else
+      # replace space with separator and remove repeating and trailing separator characters
+      gen_id = gen_id.tr_s sep_sub, sep
+      gen_id = gen_id.chop if gen_id.end_with? sep
+      # ensure id doesn't begin with idseparator if idprefix is empty (assuming idseparator is not empty)
+      gen_id = gen_id.slice 1, gen_id.length if pre.empty? && (gen_id.start_with? sep)
+    end
+    if document.catalog[:ids].key? gen_id
+      ids, cnt = document.catalog[:ids], Compliance.unique_id_start_index
+      cnt += 1 while ids.key?(candidate_id = %(#{gen_id}#{sep}#{cnt}))
+      candidate_id
+    else
+      gen_id
     end
   end
 end
